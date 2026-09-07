@@ -88,7 +88,22 @@ impl IcedChat {
             return base.into();
         };
         let Some(video) = session.video.as_ref() else {
-            return base.into();
+            let loading = container(
+                column![
+                    text("Preparing video…"),
+                    button("Cancel").on_press(AppMessage::CloseInlineVideo),
+                ]
+                .spacing(SPACE_12),
+            )
+            .padding(SPACE_16)
+            .style(container_card);
+            return stack![
+                base,
+                container(loading)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill),
+            ]
+            .into();
         };
         let Some((entry_index, entry)) = self.entries.iter().enumerate().find(|(_, entry)| {
             entry.event_id == session.key.message_id

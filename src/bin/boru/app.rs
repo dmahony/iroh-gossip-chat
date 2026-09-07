@@ -8352,7 +8352,7 @@ impl IcedChat {
             self.stop_inline_video();
             return;
         }
-        if self.inline_video_near_viewport(&key) {
+        if self.inline_video_expanded || self.inline_video_near_viewport(&key) {
             if let Some(session) = self.inline_video.as_mut() {
                 session.last_near_viewport = Instant::now();
             }
@@ -13185,6 +13185,20 @@ impl IcedChat {
                     }
                 }
 
+                let ready_offers: Vec<_> = self.files_state.offer_ready_queue
+                    .lock()
+                    .map(|mut queue| queue.drain(..).collect())
+                    .unwrap_or_default();
+                for (offer_id, ticket) in ready_offers {
+                    if self.entries.iter().any(|entry| entry.download.as_ref().is_some_and(|d| {
+                        d.direct_offer_key == Some((self.local_public, offer_id))
+                    })) {
+                        self.set_pending_direct_offer_ready(
+                            offer_id, ticket, None, self.local_public, None,
+                        );
+                    }
+                }
+
                 // ── Video poster results from detached ingest tasks ──────
                 // The DirectOffer send path generates posters inside a
                 // background tokio task that cannot touch UI state; drain
@@ -15115,6 +15129,7 @@ impl ChatCallbacks for IcedChat {
                         .push_back((index, hash, ticket));
                 }
             }
+            self.layout_cache.borrow_mut().invalidate_from(index);
             return;
         }
 

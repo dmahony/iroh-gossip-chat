@@ -1169,6 +1169,8 @@ pub(crate) struct FilesState {
     /// AppMessage::PosterGenerated so the sender's own video card renders
     /// the same preview receivers see.
     pub(crate) poster_result_queue: Arc<StdMutex<VecDeque<(String, Vec<u8>, Option<(u32, u32)>)>>>,
+    /// Local ready upgrades from detached ingest tasks, keyed by offer identity.
+    pub(crate) offer_ready_queue: Arc<StdMutex<VecDeque<(FileOfferId, String)>>>,
     /// Snapshot of the last download progress event timestamp for speed calculation.
     pub(crate) last_download_progress_at: Option<std::time::Instant>,
     /// Bytes received at the last progress event for speed calculation.
@@ -1371,6 +1373,7 @@ impl FilesState {
             paused_inbound_transfer_ids: std::collections::HashSet::new(),
             download_progress_queue: Arc::new(StdMutex::new(VecDeque::new())),
             poster_result_queue: Arc::new(StdMutex::new(VecDeque::new())),
+            offer_ready_queue: Arc::new(StdMutex::new(VecDeque::new())),
             last_download_progress_at: None,
             last_download_progress_bytes: 0,
             blocked_sharers: HashSet::new(),
@@ -6156,6 +6159,7 @@ impl IcedChat {
                     let is_video = ChatEntry::is_video_file(&filename);
                     let poster_cache_dir = self.data_dir.join("cache").join("video-posters");
                     let poster_result_queue = self.files_state.poster_result_queue.clone();
+                    let offer_ready_queue = self.files_state.offer_ready_queue.clone();
                     return iced::Task::perform(
                         async move {
                             let message = crate::Message::file_offer(
@@ -6268,6 +6272,11 @@ impl IcedChat {
                                     );
 
                                     let ticket = blob_ticket_string(endpoint_addr, blob_hash, format);
+                                    // Gossip does not echo our own announcement. Upgrade
+                                    // the local card even if the subsequent broadcast fails.
+                                    if let Ok(mut queue) = offer_ready_queue.lock() {
+                                        queue.push_back((offer_id, ticket.clone()));
+                                    }
                                     let ready = crate::Message::FileOfferReady {
                                         offer_id,
                                         ticket: ticket.clone(),
