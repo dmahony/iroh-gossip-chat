@@ -636,6 +636,10 @@ impl IcedChat {
                 // Bump the revision so the lazy sidebar Requests section
                 // re-renders with the new tunnel request.
                 self.requests_sidebar_revision = self.requests_sidebar_revision.wrapping_add(1);
+                // Refresh the cached section count as well. Without this,
+                // REQUESTS remains classified as empty and stays collapsed
+                // even though the lazy dependency contains the new row.
+                self.refresh_sidebar_counts();
                 let service_name = hex::decode(&tunnel_id)
                     .ok()
                     .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
@@ -663,6 +667,7 @@ impl IcedChat {
                     .tunnel_requests
                     .retain(|req| req.tunnel_id != tunnel_id);
                 self.requests_sidebar_revision = self.requests_sidebar_revision.wrapping_add(1);
+                self.refresh_sidebar_counts();
                 if let Ok(bytes) = hex::decode(&tunnel_id) {
                     if let Ok(id) = <[u8; 32]>::try_from(bytes.as_slice()) {
                         let tid = boru_core::tunnel::TunnelId(id);
@@ -681,6 +686,7 @@ impl IcedChat {
                     .tunnel_requests
                     .retain(|req| req.tunnel_id != tunnel_id);
                 self.requests_sidebar_revision = self.requests_sidebar_revision.wrapping_add(1);
+                self.refresh_sidebar_counts();
                 if let Ok(bytes) = hex::decode(&tunnel_id) {
                     if let Ok(id) = <[u8; 32]>::try_from(bytes.as_slice()) {
                         self.tunnels_state
