@@ -5155,7 +5155,14 @@ impl IcedChat {
                     .style(|_t, _s| iced::widget::button::Style::default());
                 let thumb_with_right_click = iced::widget::mouse_area(thumbnail)
                     .on_right_press(AppMessage::RightClickImage(i));
-                col = col.push(thumb_with_right_click);
+                // Image previews are centered independently of message
+                // direction; the surrounding message column aligns outgoing
+                // content to the end and incoming content to the start.
+                col = col.push(
+                    container(thumb_with_right_click)
+                        .width(Length::Fill)
+                        .center_x(Length::Fill),
+                );
             } else if let Some(handle) = self.image_handle_for_entry(entry) {
                 let img = iced::widget::image(handle)
                     .content_fit(iced::ContentFit::ScaleDown)
@@ -5179,7 +5186,11 @@ impl IcedChat {
                     .style(|_t, _s| iced::widget::button::Style::default());
                 let thumb_with_right_click = iced::widget::mouse_area(thumbnail)
                     .on_right_press(AppMessage::RightClickImage(i));
-                col = col.push(thumb_with_right_click);
+                col = col.push(
+                    container(thumb_with_right_click)
+                        .width(Length::Fill)
+                        .center_x(Length::Fill),
+                );
             } else if entry.image_error.is_some() || entry.image_identifier.is_some() {
                 use iced::widget::{container, Column};
                 let error_text = entry
@@ -5209,13 +5220,17 @@ impl IcedChat {
                 // a variable-height placeholder reflowed the windowed list
                 // and made images jitter while loading.
                 col = col.push(
-                    container(placeholder)
-                        .width(Length::Fixed(display_w))
-                        .height(Length::Fixed(display_h))
-                        .center_x(Length::Fill)
-                        .center_y(Length::Fill)
-                        .padding([SPACE_8, SPACE_10])
-                        .style(container_card),
+                    container(
+                        container(placeholder)
+                            .width(Length::Fixed(display_w))
+                            .height(Length::Fixed(display_h))
+                            .center_x(Length::Fill)
+                            .center_y(Length::Fill)
+                            .padding([SPACE_8, SPACE_10])
+                            .style(container_card),
+                    )
+                    .width(Length::Fill)
+                    .center_x(Length::Fill),
                 );
             }
 
@@ -7976,7 +7991,15 @@ impl IcedChat {
                         return iced::Task::none();
                     };
                     let path = play_path.clone();
-                    let Some(expected_hash) = download.expected_content_hash.clone() else {
+                    // Older or race-affected cards can have a valid blob
+                    // ticket but a missing cached identity. Derive it from
+                    // the ticket at the playback boundary instead of
+                    // rejecting an otherwise playable local/remote video.
+                    let expected_hash = download
+                        .expected_content_hash
+                        .clone()
+                        .or_else(|| content_hash_from_ticket(&download.ticket));
+                    let Some(expected_hash) = expected_hash else {
                         self.push_system(
                             "Video cannot be played because its content identity is missing.",
                         );
