@@ -794,7 +794,7 @@ impl<'a> BoruVideoFileCard<'a> {
                     body = body.push(failure_block(failure, &theme, tone, muted, error_color));
                 }
             }
-            return body.into();
+            return container(body).width(Length::Fill).align_x(Alignment::Center).into();
         }
 
         let header = self.header(attachment, &theme);
