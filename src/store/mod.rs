@@ -271,6 +271,35 @@ impl MessageStore {
             CREATE INDEX IF NOT EXISTS idx_messages_hash
                 ON messages(msg_hash);
 
+            -- Durable guards for legacy JSON migration.  Unlike the legacy
+            -- file, these records are part of the canonical store and must
+            -- survive deletion and restart.
+            CREATE TABLE IF NOT EXISTS migration_markers (
+                name TEXT PRIMARY KEY,
+                version INTEGER NOT NULL,
+                completed_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS chat_history_tombstones (
+                topic BLOB PRIMARY KEY,
+                deleted_at_ms INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS direct_offer_state (
+                topic BLOB NOT NULL,
+                owner BLOB NOT NULL,
+                offer_id BLOB NOT NULL,
+                announcement_hash BLOB,
+                ready_signed BLOB,
+                ready_at INTEGER NOT NULL DEFAULT 0,
+                has_thumbnail INTEGER NOT NULL DEFAULT 0,
+                ticket_signed BLOB,
+                ticket_at INTEGER,
+                poster_signed BLOB,
+                poster_at INTEGER,
+                local_path TEXT,
+                PRIMARY KEY(topic, owner, offer_id)
+            );
+
             CREATE TABLE IF NOT EXISTS message_replies (
                 message_hash BLOB PRIMARY KEY,
                 reply_to_message_id BLOB NOT NULL,
@@ -312,6 +341,32 @@ impl MessageStore {
         // projection was added. SQLite has no IF NOT EXISTS form for columns,
         // so the duplicate-column errors are intentionally ignored.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN thread_root_id BLOB", []);
+        // Direct-offer readiness has independent ticket and poster freshness.
+        // The legacy ready_signed projection is backfilled into both relevant
+        // projections before new updates are accepted.
+        for column in [
+            "ticket_signed BLOB",
+            "ticket_at INTEGER",
+            "poster_signed BLOB",
+            "poster_at INTEGER",
+        ] {
+            let _ = conn.execute(
+                &format!("ALTER TABLE direct_offer_state ADD COLUMN {column}"),
+                [],
+            );
+        }
+        let _ = conn.execute(
+            "UPDATE direct_offer_state
+             SET ticket_signed=COALESCE(ticket_signed,ready_signed),
+                 ticket_at=COALESCE(ticket_at,ready_at),
+                 poster_signed=CASE WHEN has_thumbnail != 0
+                                    THEN COALESCE(poster_signed,ready_signed)
+                                    ELSE poster_signed END,
+                 poster_at=CASE WHEN has_thumbnail != 0
+                                THEN COALESCE(poster_at,ready_at)
+                                ELSE poster_at END",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN reply_to_message_id BLOB", []);
         let _ = conn.execute(
             "ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
@@ -426,6 +481,8 @@ fn row_to_conversation_meta(row: &rusqlite::Row) -> Result<ConversationMeta> {
 
 mod conversation;
 mod history;
+mod direct_offer;
+pub use direct_offer::{DirectOfferState, DirectOfferStateRow};
 mod inbox;
 mod outbox;
 #[cfg(test)]

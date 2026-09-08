@@ -1,4 +1,5 @@
 /target
+/noq-proto-patched/target/
 .worktrees/
 config/klipy.env
 .gradle/

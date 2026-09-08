@@ -8,6 +8,65 @@
 use super::*;
 
 impl super::MessageStore {
+    /// Return the completed version of a named durable migration, if present.
+    pub fn migration_version(&self, name: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT version FROM migration_markers WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()
+        .std_context("read migration marker")
+    }
+
+    /// Return up to `count` of the most recent signed chat messages for a
+    /// topic, oldest first.  This is the history source shared by local
+    /// replay and the backfill protocol.
+    pub fn get_recent_signed_messages_for_topic(
+        &self,
+        topic: &[u8; 32],
+        count: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT timestamp_ms, signed_bytes FROM messages
+                 WHERE topic = ?1 AND signed_bytes IS NOT NULL
+                 ORDER BY timestamp_ms DESC, id DESC LIMIT ?2",
+            )
+            .std_context("prepare recent signed messages for topic")?;
+        let mut rows = stmt
+            .query(params![topic.as_slice(), count as i64])
+            .std_context("query recent signed messages for topic")?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().std_context("read recent signed message")? {
+            result.push((
+                row.get::<_, i64>(0).std_context("read message timestamp")? as u64,
+                row.get::<_, Vec<u8>>(1).std_context("read signed message bytes")?,
+            ));
+        }
+        result.reverse();
+        Ok(result)
+    }
+
+    /// Count signed chat messages for a topic, excluding metadata-only rows.
+    pub fn count_signed_messages_for_topic(&self, topic: &[u8; 32]) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages
+                 WHERE topic = ?1 AND signed_bytes IS NOT NULL",
+                [topic.as_slice()],
+                |row| row.get(0),
+            )
+            .std_context("count signed messages for topic")?;
+        Ok(count as usize)
+    }
+
     /// Store an optional reply target for a message. The operation is
     /// idempotent, which is important for duplicate and reordered backfill.
     pub fn insert_reply_reference(
@@ -172,8 +231,32 @@ impl super::MessageStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .std_context("begin legacy chat history import")?;
+        const MIGRATION_NAME: &str = "chat_history_json_to_messages";
+        const MIGRATION_VERSION: i64 = 1;
+        let already_completed: Option<i64> = tx
+            .query_row(
+                "SELECT version FROM migration_markers WHERE name = ?1",
+                [MIGRATION_NAME],
+                |row| row.get(0),
+            )
+            .optional()
+            .std_context("check legacy chat history migration marker")?;
+        if already_completed == Some(MIGRATION_VERSION) {
+            return Ok(0);
+        }
         let mut inserted = 0usize;
         for entry in entries {
+            let deleted: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM chat_history_tombstones WHERE topic = ?1)",
+                    [entry.topic.as_bytes().as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .std_context("check legacy chat history tombstone")?
+                != 0;
+            if deleted {
+                continue;
+            }
             let hash_vec = hex::decode(&entry.hash).unwrap_or_default();
             let hash = if hash_vec.len() == 32 {
                 let mut value = [0u8; 32];
@@ -244,6 +327,14 @@ impl super::MessageStore {
                 .std_context("update conversation meta for legacy chat message")?;
             }
         }
+        tx.execute(
+            "INSERT INTO migration_markers (name, version, completed_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET version = excluded.version,
+                                             completed_at_ms = excluded.completed_at_ms",
+            params![MIGRATION_NAME, MIGRATION_VERSION, unix_now_ms() as i64],
+        )
+        .std_context("record legacy chat history migration marker")?;
         tx.commit()
             .std_context("commit legacy chat history import")?;
         Ok(inserted)
@@ -360,7 +451,7 @@ impl super::MessageStore {
                         signed_bytes, delivery_state, image_identifier, id
                  FROM messages
                  WHERE topic = ?1
-                 ORDER BY timestamp_ms ASC
+                 ORDER BY timestamp_ms ASC, id ASC
                  LIMIT ?2 OFFSET ?3",
             )
             .std_context("prepare get_messages_for_topic")?;
@@ -425,10 +516,20 @@ impl super::MessageStore {
 
     /// Remove all messages for a topic (used when a room is deleted).
     pub fn delete_messages_for_topic(&self, topic: &[u8; 32]) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        let deleted = conn
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().std_context("begin topic history deletion")?;
+        tx.execute(
+            "INSERT OR REPLACE INTO chat_history_tombstones (topic, deleted_at_ms)
+             VALUES (?1, ?2)",
+            params![topic.as_slice(), unix_now_ms() as i64],
+        )
+        .std_context("record topic history tombstone")?;
+        tx.execute("DELETE FROM direct_offer_state WHERE topic=?1", [topic.as_slice()])
+            .std_context("delete direct offer state")?;
+        let deleted = tx
             .execute("DELETE FROM messages WHERE topic = ?1", [topic.as_slice()])
             .std_context("delete messages for topic")?;
+        tx.commit().std_context("commit topic history deletion")?;
         Ok(deleted)
     }
 

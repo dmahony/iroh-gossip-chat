@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use iroh::{Endpoint, SecretKey};
+use iroh::{Endpoint, PublicKey, SecretKey};
 use n0_error::Result;
 use n0_future::StreamExt;
 
@@ -21,6 +21,7 @@ use super::{
     DIAGNOSTIC_SEEN_MESSAGES, SEEN_MESSAGES,
 };
 use crate::api::{Event, GossipReceiver};
+use crate::authorization::Permission;
 use crate::diagnostics::{DiagnosticEventKind, ReceivedProbe};
 use crate::friends::FriendId;
 use crate::proto::TopicId;
@@ -28,6 +29,66 @@ use crate::public_room_safety::PublicRoomSafety;
 
 /// Maximum clock-skew tolerance for future-dated messages (5 minutes).
 const MAX_FUTURE_SKEW_SECS: u64 = 300;
+
+/// Apply the receive guards before persisting an inactive-room attachment.
+/// Background queues do not otherwise enter the normal callback dispatcher.
+pub fn direct_offer_history_allowed(
+    cb: &impl ChatCallbacks,
+    topic: Option<TopicId>,
+    from: &PublicKey,
+    sent_at: u64,
+) -> bool {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    *from != cb.local_public()
+        && !cb.is_blocked(from)
+        && (cb.is_friend(from) || cb.accepts_group_peer(topic, from))
+        && cb.room_allows(topic, from, crate::authorization::Permission::SendMessages)
+        && now.saturating_sub(sent_at) <= cb.message_ttl().as_secs()
+        && sent_at.saturating_sub(now) <= MAX_FUTURE_SKEW_SECS
+}
+
+/// Return the room capability required before applying a message's effects.
+///
+/// Keep this classification exhaustive: every message variant that can create
+/// or modify user-visible room content must pass through the same authorization
+/// boundary before persistence or rendering. Control-plane messages are
+/// intentionally left unclassified because they have their own handling rules.
+pub(crate) fn required_room_permission(message: &super::protocol::Message) -> Option<Permission> {
+    use super::protocol::Message as ChatMessage;
+    use ChatMessage::*;
+    match message {
+        Message { .. }
+        | Reply { .. }
+        | ThreadMessage { .. }
+        | MessageWithMentions { .. }
+        | FileShare { .. }
+        | FileOffer { .. }
+        | FileOfferReady { .. }
+        | ImageShare { .. }
+        | Edit { .. }
+        | Delete { .. }
+        | Reaction { .. }
+        | ReactionAdd { .. }
+        | ReactionRemove { .. }
+        | ProfileUpdate(_)
+        | EncryptedGroupMessage { .. }
+        | SharedGif { .. } => Some(Permission::SendMessages),
+        PinMessage { .. } | UnpinMessage { .. } => Some(Permission::PinMessages),
+        ContactControl { .. } => Some(Permission::Invite),
+        RoomAdvertisement { .. } | RoomWithdrawal { .. } => Some(Permission::ManageRoom),
+        AboutMe { .. }
+        | Typing { .. }
+        | RoomAuthorization { .. }
+        | Leave
+        | Presence
+        | PresenceWithTicket { .. }
+        | ReadReceipt { .. }
+        | Heartbeat
+        | LatencyPing { .. }
+        | LatencyPong { .. }
+        | DiagnosticProbe(_) => None,
+    }
+}
 
 /// Apply public-room safety checks to a [`NetEvent`].
 ///
@@ -204,18 +265,7 @@ pub fn handle_net_event_for_topic(
                 return Ok(());
             }
 
-            let required_permission = match &message {
-                Message::Message { .. }
-                | Message::Edit { .. }
-                | Message::Delete { .. }
-                | Message::Reaction { .. }
-                | Message::FileShare { .. }
-                | Message::ImageShare { .. }
-                | Message::ProfileUpdate(_) => Some(crate::authorization::Permission::SendMessages),
-                Message::ContactControl { .. } => Some(crate::authorization::Permission::Invite),
-                Message::RoomAdvertisement { .. } => Some(crate::authorization::Permission::ManageRoom),
-                _ => None,
-            };
+            let required_permission = required_room_permission(&message);
             if required_permission.is_some_and(|permission| !cb.room_allows(topic, &from, permission)) {
                 tracing::debug!("dropping room message from unauthorized peer {}", from.fmt_short());
                 return Ok(());
@@ -534,6 +584,9 @@ pub fn handle_net_event_for_topic(
                         let fid = FriendId::from_public_key(from);
                         cb.friend_mark_online(fid);
                         let sender_label = cb.resolve_name(&from);
+                        if let Some(signed) = get_signed_message(from, incoming_hash, sent_at) {
+                            cb.persist_remote_file_share(topic, from, incoming_hash, sent_at, &name, Some(signed));
+                        }
                         cb.set_pending_direct_offer(offer_id, name, size, from, Some(sender_label));
                     }
                 }
@@ -545,6 +598,9 @@ pub fn handle_net_event_for_topic(
                     if from != cb.local_public()
                         && (cb.is_friend(&from) || cb.accepts_group_peer(topic, &from))
                     {
+                        if let Some(signed) = get_signed_message(from, incoming_hash, sent_at) {
+                            cb.persist_remote_file_share(topic, from, incoming_hash, sent_at, "", Some(signed));
+                        }
                         let fid = FriendId::from_public_key(from);
                         cb.friend_mark_online(fid);
                         let sender_label = cb.resolve_name(&from);
@@ -977,6 +1033,49 @@ pub async fn forward_gossip_events_with_safety(
         }
     }
     let _ = net_tx.send(NetEvent::Closed).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::required_room_permission;
+    use crate::authorization::Permission;
+    use crate::chat_core::Message;
+    use crate::threads::ThreadTarget;
+
+    #[test]
+    fn all_text_message_variants_require_send_messages() {
+        let cases = [
+            Message::Message { text: "text".into() },
+            Message::Reply { text: "reply".into(), reply_to_message_id: [1; 32] },
+            Message::MessageWithMentions { text: "@peer".into(), mentions: Vec::new() },
+            Message::ThreadMessage { text: "thread".into(), target: ThreadTarget::root([2; 32]) },
+        ];
+        for message in cases {
+            assert_eq!(required_room_permission(&message), Some(Permission::SendMessages));
+        }
+    }
+
+    #[test]
+    fn attachment_variants_require_send_messages() {
+        let cases = [
+            Message::FileOffer { offer_id: crate::chat_core::FileOfferId::generate(), name: "file.txt".into(), size: 12 },
+            Message::FileOfferReady { offer_id: crate::chat_core::FileOfferId::generate(), ticket: "ticket".into(), thumbnail_hash: None },
+            Message::ImageShare { name: "image.png".into(), hash: [3; 32] },
+            Message::SharedGif { gif: Default::default() },
+        ];
+        for message in cases {
+            assert_eq!(required_room_permission(&message), Some(Permission::SendMessages));
+        }
+    }
+
+    #[test]
+    fn pin_operations_use_pin_permission() {
+        let message = Message::PinMessage {
+            topic: crate::proto::TopicId::from_bytes([0; 32]),
+            message_hash: [4; 32],
+        };
+        assert_eq!(required_room_permission(&message), Some(Permission::PinMessages));
+    }
 }
 
 /// Update `StatusContext.direct_peers` and `.relayed_peers` by querying the

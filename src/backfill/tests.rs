@@ -14,6 +14,7 @@ use super::*;
 use crate::chat_core::{Message, SignedMessage};
 use crate::contact::direct_topic;
 use crate::proto::TopicId;
+use crate::store::MessageStore;
 use crate::public_room::{public_lobby_topic, PublicNetwork};
 use crate::storage::{GroupEpochRow, GroupMemberRow, GroupRow, Storage};
 use bytes::Bytes;
@@ -187,20 +188,20 @@ async fn test_backfill_handle_spawn_and_drop() {
 /// Used to test timeout behaviour.
 #[derive(Debug, Clone)]
 struct DelayedBackfillHandler {
-    storage: Arc<Storage>,
+    message_store: MessageStore,
     authorizer: BackfillAuthorizer,
     delay: Duration,
 }
 
 impl ProtocolHandler for DelayedBackfillHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        let storage = self.storage.clone();
+        let message_store = self.message_store.clone();
         let authorizer = self.authorizer.clone();
         let delay = self.delay;
         tokio::task::spawn(async move {
             // Add the configured delay before processing
             tokio::time::sleep(delay).await;
-            let _result = serve_backfill(connection, &storage, &authorizer).await;
+            let _result = serve_backfill(connection, &message_store, &authorizer).await;
         });
         Ok(())
     }
@@ -228,7 +229,7 @@ async fn test_backfill_slow_peer_times_out() {
     // the delay fires first on the server side.
     let storage = Arc::new(Storage::memory().unwrap());
     let slow_handler = DelayedBackfillHandler {
-        storage: storage.clone(),
+        message_store: MessageStore::memory().unwrap(),
         authorizer: BackfillAuthorizer::new(storage.clone(), sk_responder.public()),
         // Delay long enough that the client timeout fires first.
         // With paused tokio time, this is virtual time — instant in wall-clock.
@@ -294,7 +295,11 @@ async fn test_backfill_normal_succeeds() {
     // Set up an empty SQLite storage.
     let storage = Arc::new(Storage::memory().unwrap());
 
-    let handler = BackfillProtocolHandler::new(storage.clone(), sk_responder.public());
+    let handler = BackfillProtocolHandler::new(
+        MessageStore::memory().unwrap(),
+        storage.clone(),
+        sk_responder.public(),
+    );
 
     let _router = iroh::protocol::Router::builder(ep_responder.clone())
         .accept(BACKFILL_ALPN, handler)
@@ -338,6 +343,14 @@ async fn spawn_responder(
     storage: Arc<Storage>,
     sk: &SecretKey,
 ) -> (EndpointAddr, iroh::protocol::Router) {
+    spawn_responder_with_store(storage, MessageStore::memory().unwrap(), sk).await
+}
+
+async fn spawn_responder_with_store(
+    storage: Arc<Storage>,
+    message_store: MessageStore,
+    sk: &SecretKey,
+) -> (EndpointAddr, iroh::protocol::Router) {
     let ep = Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .secret_key(sk.clone())
         .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddrV4>().unwrap())
@@ -345,7 +358,11 @@ async fn spawn_responder(
         .bind()
         .await
         .expect("bind responder endpoint");
-    let handler = BackfillProtocolHandler::new(storage.clone(), sk.public());
+    let handler = BackfillProtocolHandler::new(
+        message_store,
+        storage.clone(),
+        sk.public(),
+    );
     let router = iroh::protocol::Router::builder(ep.clone())
         .accept(BACKFILL_ALPN, handler)
         .spawn();
@@ -375,8 +392,9 @@ async fn spawn_requester_with(sk: &SecretKey) -> Endpoint {
 fn make_group_storage(
     local_sk: &SecretKey,
     member_sk: &SecretKey,
-) -> (Arc<Storage>, TopicId, [u8; 32]) {
+) -> (Arc<Storage>, TopicId, [u8; 32], MessageStore) {
     let storage = Arc::new(Storage::memory().unwrap());
+    let message_store = MessageStore::memory().unwrap();
     let group_id = [7u8; 32];
     let topic = TopicId::from_bytes([0xAB; 32]);
     storage
@@ -422,16 +440,20 @@ fn make_group_storage(
         },
     )
     .unwrap();
-    storage
+    message_store
         .insert_chat_message(
             &[1u8; 32],
-            &topic,
+            topic.as_bytes(),
             member_sk.public().as_bytes(),
             1000,
-            &signed,
+            "text",
+            "audit hello",
+            Some(&signed),
+            None,
+            local_sk.public().as_bytes(),
         )
         .unwrap();
-    (storage, topic, group_id)
+    (storage, topic, group_id, message_store)
 }
 
 /// Raw length-prefixed backfill exchange — lets a test send a request
@@ -523,8 +545,9 @@ async fn backfill_rejects_request_without_topic() {
 async fn backfill_authorizes_group_membership() {
     let sk_responder = SecretKey::generate();
     let sk_member = SecretKey::generate();
-    let (storage, topic, group_id) = make_group_storage(&sk_responder, &sk_member);
-    let (addr, _router) = spawn_responder(storage.clone(), &sk_responder).await;
+    let (storage, topic, group_id, message_store) = make_group_storage(&sk_responder, &sk_member);
+    let (addr, _router) =
+        spawn_responder_with_store(storage.clone(), message_store, &sk_responder).await;
 
     // Outsider (never a member) → denied.
     let (ep_outsider, _) = spawn_requester().await;
@@ -582,7 +605,7 @@ async fn backfill_authorizes_group_membership() {
 async fn backfill_rechecks_authorization_on_next_page() {
     let sk_responder = SecretKey::generate();
     let sk_member = SecretKey::generate();
-    let (storage, topic, group_id) = make_group_storage(&sk_responder, &sk_member);
+    let (storage, topic, group_id, _message_store) = make_group_storage(&sk_responder, &sk_member);
     let (addr, _router) = spawn_responder(storage.clone(), &sk_responder).await;
     let ep = spawn_requester_with(&sk_member).await;
 
@@ -615,7 +638,7 @@ async fn backfill_rechecks_authorization_on_next_page() {
 async fn backfill_unknown_and_forbidden_topics_look_identical() {
     let sk_responder = SecretKey::generate();
     let sk_member = SecretKey::generate();
-    let (storage, topic, _group_id) = make_group_storage(&sk_responder, &sk_member);
+    let (storage, topic, _group_id, _message_store) = make_group_storage(&sk_responder, &sk_member);
     let (addr, _router) = spawn_responder(storage, &sk_responder).await;
     let (ep, _) = spawn_requester().await;
 

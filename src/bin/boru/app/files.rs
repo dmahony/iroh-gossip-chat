@@ -6161,6 +6161,8 @@ impl IcedChat {
                     let poster_cache_dir = self.data_dir.join("cache").join("video-posters");
                     let poster_result_queue = self.files_state.poster_result_queue.clone();
                     let offer_ready_queue = self.files_state.offer_ready_queue.clone();
+                    let history_path = self.data_dir.join("message_store.db");
+                    let history_topic = self.topic;
                     return iced::Task::perform(
                         async move {
                             let message = crate::Message::file_offer(
@@ -6171,14 +6173,36 @@ impl IcedChat {
                             .map_err(|error| error.to_string())?;
                             let encoded = SignedMessage::sign_and_encode(&secret_key, &message)
                                 .map_err(|error| format!("Failed to sign file offer: {error}"))?;
+                            boru_core::store::MessageStore::open(&history_path)
+                                .and_then(|store| {
+                                    store.persist_direct_offer(
+                                        history_topic.as_bytes(),
+                                        &encoded,
+                                        &secret_key.public().as_bytes(),
+                                        Some(&source_path_string),
+                                    )
+                                })
+                                .map_err(|error| {
+                                    format!("Failed to persist file offer: {error}")
+                                })?;
                             let sender = sender.ok_or_else(|| {
                                 "chat gossip sender became unavailable before file offer broadcast"
                                     .to_string()
                             })?;
-                            sender
-                                .broadcast(encoded)
-                                .await
-                                .map_err(|error| format!("Failed to broadcast file offer: {error}"))?;
+                            sender.broadcast(encoded).await.map_err(|error| {
+                                format!("Failed to broadcast file offer: {error}")
+                            })?;
+                            boru_core::store::MessageStore::open(&history_path)
+                                .and_then(|store| {
+                                    store.mark_direct_offer_sent(
+                                        history_topic.as_bytes(),
+                                        &secret_key.public().as_bytes(),
+                                        offer_id,
+                                    )
+                                })
+                                .map_err(|error| {
+                                    format!("Failed to mark file offer sent: {error}")
+                                })?;
                             let sender = Some(sender);
                             tracing::info!(
                                 event = boru_core::diagnostics::event_names::OFFER_BROADCAST,
@@ -6285,6 +6309,10 @@ impl IcedChat {
                                     };
                                     let encoded = SignedMessage::sign_and_encode(&secret_key, &ready)
                                         .map_err(|e| format!("failed to sign FileOfferReady: {e}"))?;
+                                    boru_core::store::MessageStore::open(&history_path)
+                                        .and_then(|store| store.persist_direct_offer(history_topic.as_bytes(), &encoded,
+                                            &secret_key.public().as_bytes(), None))
+                                        .map_err(|error| format!("Failed to persist file ticket: {error}"))?;
                                     if let Some(sender) = sender.as_ref() {
                                         sender
                                             .broadcast(encoded)
@@ -6352,6 +6380,10 @@ impl IcedChat {
                                                 .map_err(|e| {
                                                     format!("failed to sign poster upgrade: {e}")
                                                 })?;
+                                                boru_core::store::MessageStore::open(&history_path)
+                                                    .and_then(|store| store.persist_direct_offer(history_topic.as_bytes(), &encoded,
+                                                        &secret_key.public().as_bytes(), None))
+                                                    .map_err(|error| format!("Failed to persist file poster: {error}"))?;
                                                 if let Some(sender) = sender.as_ref() {
                                                     sender.broadcast(encoded).await.map_err(|e| {
                                                         format!(
@@ -7085,6 +7117,15 @@ impl IcedChat {
                     .clone()
                     .unwrap_or_else(|| "download".to_string());
                 let data_dir = self.data_dir.clone();
+                let history_topic = self.topic;
+                let direct_offer_key = dl.direct_offer_key;
+                let download_target = crate::app::DownloadTarget {
+                    topic: self.topic,
+                    generation: self.conversation_generation,
+                    entry_index,
+                    transfer_id: dl.transfer_id,
+                    direct_offer_key,
+                };
                 let progress_queue = self.files_state.download_progress_queue.clone();
                 iced::Task::perform(
                     async move {
@@ -7172,6 +7213,12 @@ impl IcedChat {
                         let save_path = destination
                             .publish()
                             .map_err(|e| format!("Publish failed: {e}"))?;
+                        if let Some((owner, offer_id)) = direct_offer_key {
+                            boru_core::store::MessageStore::open(&data_dir.join("message_store.db"))
+                                .and_then(|store| store.set_direct_offer_local_path(
+                                    history_topic.as_bytes(), owner.as_bytes(), offer_id, &save_path))
+                                .map_err(|error| format!("Downloaded file, but could not save history: {error}"))?;
+                        }
                         Ok::<_, String>((name.clone(), save_path, false))
                     },
                     move |r| match r {
@@ -7180,7 +7227,11 @@ impl IcedChat {
                                 "Skipped — {name} already exists (overwrite policy is Skip)."
                             ))
                         }
-                        Ok((name, path, _)) => AppMessage::DownloadDone(name, path),
+                        Ok((name, path, _)) => AppMessage::DownloadDone(crate::app::DownloadCompletion {
+                            target: download_target,
+                            name,
+                            path,
+                        }),
                         Err(e) => AppMessage::DownloadFailed(e),
                     },
                 )
@@ -7261,24 +7312,34 @@ impl IcedChat {
                 self.push_system(format!("Sharing: {name}"));
                 iced::Task::none()
             }
-            AppMessage::DownloadDone(name, path) => {
+            AppMessage::DownloadDone(completion) => {
+                let crate::app::DownloadCompletion { target, name, path } = completion;
                 tracing::info!(%name, path=%path.display(), "DownloadDone received");
                 self.push_system(format!("*{name}* is complete"));
                 let poster_path = path.clone();
                 let mut is_video = false;
+                // A completion belongs to the room and generation captured
+                // when the task started.  A stale completion must never use
+                // the current room's row index as a fallback.
+                if target.topic != self.topic || target.generation != self.conversation_generation {
+                    tracing::info!(?target, current_topic=%self.topic, current_generation=self.conversation_generation, "ignoring stale download completion");
+                    return iced::Task::none();
+                }
                 let completed_idx = self
                     .entries
                     .iter()
                     .position(|entry| {
                         entry.download.as_ref().is_some_and(|download| {
                             download.name == name
+                                && download.direct_offer_key == target.direct_offer_key
+                                && download.transfer_id == target.transfer_id
                                 && matches!(
                                     download.state,
                                     DownloadState::Active { .. } | DownloadState::Completed { .. }
                                 )
                         })
                     })
-                    .or(self.download_entry_index);
+                    .filter(|idx| *idx == target.entry_index);
                 tracing::info!(
                     idx=?completed_idx,
                     download_entry_index=?self.download_entry_index,
@@ -7318,6 +7379,21 @@ impl IcedChat {
                                 return iced::Task::none();
                             }
                             // Progress totals may describe only a streamed range.
+                            if let Some((owner, offer_id)) = download.direct_offer_key {
+                                if let Err(error) = boru_core::store::MessageStore::open(
+                                    &self.data_dir.join("message_store.db"),
+                                )
+                                .and_then(|store| {
+                                    store.set_direct_offer_local_path(
+                                        target.topic.as_bytes(),
+                                        &owner.as_bytes(),
+                                        offer_id,
+                                        &path,
+                                    )
+                                }) {
+                                    tracing::warn!(%error, "failed to persist direct-offer download path");
+                                }
+                            }
                             let total_size = std::fs::metadata(&path).ok().map(|m| m.len());
                             download.state = DownloadState::Completed {
                                 saved_name: name.clone(),
@@ -8890,6 +8966,13 @@ impl IcedChat {
                     }
                 }
 
+                let download_target = crate::app::DownloadTarget {
+                    topic: self.topic,
+                    generation: self.conversation_generation,
+                    entry_index: self.download_entry_index.unwrap_or_default(),
+                    transfer_id: None,
+                    direct_offer_key: None,
+                };
                 let blob_store = self.blob_store.clone();
                 let endpoint = self.endpoint.clone();
                 let neighbors = self.neighbors.clone();
@@ -8946,9 +9029,11 @@ impl IcedChat {
                         Ok::<_, String>((name, save_path))
                     },
                     move |r| match r {
-                        Ok((name, path)) => {
-                            AppMessage::DownloadDone(name, path)
-                        }
+                        Ok((name, path)) => AppMessage::DownloadDone(crate::app::DownloadCompletion {
+                            target: download_target,
+                            name,
+                            path,
+                        }),
                         Err(e) => AppMessage::DownloadFailed(e),
                     },
                 )

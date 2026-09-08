@@ -8,6 +8,8 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -138,7 +140,7 @@ pub const MAX_METADATA_PROBE_BYTES: u64 = 512 * 1024 * 1024;
 /// Probe a verified local video for intrinsic width, height, and duration.
 ///
 /// Runs `ffprobe` (the same media toolchain used by the poster probe) with a
-/// hard `-timelimit` and a bounded input size. The result never fabricates
+/// supervisor-enforced wall-clock timeout and a bounded input size. The result never fabricates
 /// measurements: width/height/duration that the container does not expose
 /// remain `None`, and the caller is expected to fall back to a bounded
 /// generic media frame. This function is intentionally blocking; callers must
@@ -151,7 +153,8 @@ pub fn probe_local_video_metadata(path: &Path) -> Result<MediaMetadata, String> 
     if input_size == 0 || input_size > MAX_METADATA_PROBE_BYTES {
         return Err("video is outside the metadata probe size limit".to_string());
     }
-    let output = std::process::Command::new("ffprobe")
+    let mut command = Command::new("ffprobe");
+    command
         .args([
             "-v",
             "error",
@@ -163,12 +166,9 @@ pub fn probe_local_video_metadata(path: &Path) -> Result<MediaMetadata, String> 
             "format=duration",
             "-of",
             "default=noprint_wrappers=1:nokey=1",
-            "-timelimit",
-            "10",
         ])
-        .arg(path)
-        .output()
-        .map_err(|e| format!("start ffprobe: {e}"))?;
+        .arg(path);
+    let output = run_command_with_timeout(&mut command, Duration::from_secs(10), "ffprobe")?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ffprobe metadata probe failed: {}", detail.trim()));
@@ -176,6 +176,66 @@ pub fn probe_local_video_metadata(path: &Path) -> Result<MediaMetadata, String> 
     Ok(parse_metadata_output(&String::from_utf8_lossy(
         &output.stdout,
     )))
+}
+
+/// Run a media subprocess with a hard wall-clock bound.
+///
+/// Both pipes are drained concurrently so noisy media tools cannot deadlock
+/// on a full pipe. A timed-out child is killed and waited for before returning,
+/// ensuring that it is reaped.
+pub(crate) fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    program: &str,
+) -> Result<Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("start {program}: {error}"))?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let stdout_thread = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(format!("{program} probe timed out after {timeout:?}"));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(format!("wait for {program}: {error}"));
+            }
+        }
+    };
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| format!("read {program} stdout"))?;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| format!("read {program} stderr"))?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Parse the plain-text `ffprobe` output (`width\nheight\nduration`).
@@ -1040,6 +1100,18 @@ mod tests {
         let metadata = parse_metadata_output("   \nN/A\n");
         assert_eq!(metadata.width, None);
         assert_eq!(metadata.duration_ms, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn media_subprocess_timeout_kills_and_reaps_child() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let started = Instant::now();
+        let error = run_command_with_timeout(&mut command, Duration::from_millis(50), "test")
+            .expect_err("sleeping child must time out");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.contains("timed out"));
     }
 
     #[test]

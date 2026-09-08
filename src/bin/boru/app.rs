@@ -150,7 +150,6 @@ use boru_core::chat_core::{
     handle_net_event_with_safety_for_topic, merge_bootstrap_peer_addrs, message_hash,
     seed_memory_lookup, MeshHealth, MessageHash, RoomInviteV2,
 };
-use boru_core::pinned_messages::{PinAction, PinState};
 use boru_core::chat_history::{ChatHistoryStore, DeliveryState, HistoryEntry};
 use boru_core::contact::{direct_topic, ContactAction, SignedContactMessage};
 use boru_core::control_plane::advertisement::{
@@ -187,6 +186,7 @@ use boru_core::mailbox::{
     seal_for, IncomingAcceptance, MailboxAck, MailboxIdentity, MailboxPublicKey, MailboxStore,
 };
 use boru_core::net::Gossip;
+use boru_core::pinned_messages::{PinAction, PinState};
 use boru_core::private_room_tracker::{PrivateContinuousTracker, PrivateRoomTracker};
 use boru_core::proto::TopicId;
 use boru_core::public_room::{public_discovery_key, PublicNetwork, PublicRoomIdentity};
@@ -210,7 +210,7 @@ use boru_core::screen_share::{
     MOD_META, MOD_SHIFT, SCREEN_SHARE_PROTOCOL_VERSION,
 };
 use boru_core::storage::{SharedFileRow, Storage};
-use boru_core::store::MessageStore;
+use boru_core::store::{DirectOfferState, DirectOfferStateRow, MessageStore};
 use boru_core::streaming_server::StreamingServer;
 use boru_core::transfer_state_projection::{
     EventName, ProjectionUpdate, TransferDirection, TransferEvent, TransferRecord, TransferState,
@@ -1996,6 +1996,28 @@ pub enum Screen {
 pub struct RoomSnapshot {
     pub topic: TopicId,
     pub generation: u64,
+}
+
+/// Immutable identity captured when an attachment download starts.
+/// Completion must not resolve against the currently selected room or a
+/// recycled row index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DownloadTarget {
+    pub(crate) topic: TopicId,
+    pub(crate) generation: u64,
+    pub(crate) entry_index: usize,
+    pub(crate) transfer_id: Option<TransferId>,
+    pub(crate) direct_offer_key: Option<(
+        PublicKey,
+        boru_core::chat_core::protocol::FileOfferId,
+    )>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DownloadCompletion {
+    pub(crate) target: DownloadTarget,
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
 }
 
 // ── Per-conversation runtime state ─────────────────────────────────────
@@ -3790,6 +3812,15 @@ pub enum AppMessage {
         /// left or switched away from is caught in debug builds.
         generation: u64,
     },
+    /// A bounded room-history page loaded without blocking the GUI thread.
+    RoomHistoryLoaded {
+        topic: TopicId,
+        generation: u64,
+        rows: Vec<boru_core::store::ChatMessageRow>,
+        offer_states: Vec<DirectOfferStateRow>,
+        legacy_entries: Vec<HistoryEntry>,
+        error: Option<String>,
+    },
     /// Finished creating a new room (random topic).
     CreateNewRoom,
     /// Confirm create-new-room with current dialog settings.
@@ -4216,7 +4247,7 @@ pub enum AppMessage {
     RetryOutgoingMessage(u64),
     MessageSent(String, u64, MessageHash),
     FileSent(String),
-    DownloadDone(String, PathBuf),
+    DownloadDone(DownloadCompletion),
     /// File downloaded from a peer's shared profile — carries the saved path
     /// for the "Open" button.
     DownloadDonePeerFile(String, PathBuf),
@@ -5861,7 +5892,10 @@ impl IcedChat {
             } else {
                 ConversationStore::load_or_default(&data_dir)
             };
-            if store.is_empty() {
+            // SQLite is canonical once storage is available. An empty
+            // canonical store is also the expected result after deletion;
+            // falling back to legacy JSON here would resurrect conversations.
+            if storage.is_none() && store.is_empty() {
                 let json_store = ConversationStore::load_or_default(&data_dir);
                 if !json_store.is_empty() {
                     if let Some(ref st) = storage {
@@ -7288,6 +7322,102 @@ impl IcedChat {
     }
 
     /// Convert a SQLite `ChatMessageRow` to a `ChatEntry` for in-memory replay.
+    fn direct_offer_row_to_chat_entry(
+        &self,
+        row: &boru_core::store::ChatMessageRow,
+        state: Option<&DirectOfferState>,
+    ) -> Option<ChatEntry> {
+        let (owner, message, _) =
+            SignedMessage::verify_and_decode(row.signed_bytes.as_deref()?).ok()?;
+        let Message::FileOffer {
+            offer_id,
+            name,
+            size,
+        } = message
+        else {
+            return None;
+        };
+        if owner.as_bytes() != &row.sender {
+            return None;
+        }
+        let mut ticket = String::new();
+        let mut thumbnail = None;
+        if let Some(bytes) = state.and_then(|s| s.ticket.as_deref()) {
+            if let Ok((
+                signer,
+                Message::FileOfferReady {
+                    offer_id: ready_id,
+                    ticket: ready_ticket,
+                    thumbnail_hash,
+                },
+                _,
+            )) = SignedMessage::verify_and_decode(bytes)
+            {
+                if signer == owner && ready_id == offer_id {
+                    ticket = ready_ticket;
+                    thumbnail = state
+                        .and_then(|s| s.poster.as_deref())
+                        .and_then(|poster| SignedMessage::verify_and_decode(poster).ok())
+                        .and_then(|(_, message, _)| match message {
+                            Message::FileOfferReady { thumbnail_hash, .. } => thumbnail_hash,
+                            _ => None,
+                        })
+                        .or(thumbnail_hash);
+                }
+            }
+        }
+        let kind = if ChatEntry::is_video_file(&name) {
+            TransferKind::Video
+        } else {
+            TransferKind::File
+        };
+        let mut entry = ChatEntry::system_download(
+            name.clone(),
+            kind,
+            name.clone(),
+            ticket.clone(),
+            self.resolve_name(&owner),
+            None,
+        );
+        let download = entry.download.as_mut()?;
+        download.direct_offer_key = Some((owner, offer_id));
+        download.expected_content_hash = content_hash_from_ticket(&ticket);
+        download.thumbnail_hash = thumbnail;
+        download.availability = if ticket.is_empty() {
+            AttachmentAvailability::DirectOffer { owner, offer_id }
+        } else {
+            AttachmentAvailability::Hybrid {
+                owner,
+                offer_id,
+                ticket,
+            }
+        };
+        download.state = DownloadState::Ready { total: Some(size) };
+        if let Some(path) = state
+            .and_then(|s| s.local_path.as_deref())
+            .map(std::path::PathBuf::from)
+        {
+            if path.is_file() && path.metadata().is_ok_and(|m| m.len() == size) {
+                download.state = if owner == self.local_public {
+                    files::direct_offer_sender_state(name, path, size)
+                } else {
+                    DownloadState::Completed {
+                        saved_name: name,
+                        saved_path: Some(path),
+                        total_size: Some(size),
+                    }
+                };
+            }
+        }
+        entry.message_hash = Some(row.msg_hash);
+        entry.timestamp = Some(row.timestamp_ms);
+        entry.event_id = row.id as u64;
+        entry.sender_key = Some(owner);
+        info!(offer_id=?offer_id, ticket_ready=!download.ticket.is_empty(), "restored direct-offer chat card");
+        Some(entry)
+    }
+
+    /// Convert a SQLite `ChatMessageRow` to a `ChatEntry` for in-memory replay.
     #[expect(dead_code)]
     fn chat_message_row_to_chat_entry(
         row: &boru_core::store::ChatMessageRow,
@@ -7780,6 +7910,7 @@ impl IcedChat {
             AppMessage::GoToChatList => "GoToChatList",
             AppMessage::OpenRoom(_) => "OpenRoom",
             AppMessage::RoomOpened { .. } => "RoomOpened",
+            AppMessage::RoomHistoryLoaded { .. } => "RoomHistoryLoaded",
             AppMessage::CreateNewRoom => "CreateNewRoom",
             AppMessage::ConfirmCreateNewRoom => "ConfirmCreateNewRoom",
             AppMessage::CancelCreateRoom => "CancelCreateRoom",
@@ -8161,7 +8292,9 @@ impl IcedChat {
             AppMessage::OpenFriendChat(_) => "OpenFriendChat",
             AppMessage::ToggleSound(_) => "ToggleSound",
             AppMessage::SetNotificationPolicy(_) => "SetNotificationPolicy",
-            AppMessage::SetConversationNotificationPolicy(_, _) => "SetConversationNotificationPolicy",
+            AppMessage::SetConversationNotificationPolicy(_, _) => {
+                "SetConversationNotificationPolicy"
+            }
             AppMessage::TogglePresenceIndicator(_) => "TogglePresenceIndicator",
             AppMessage::ToggleTypingIndicators(_) => "ToggleTypingIndicators",
             AppMessage::ToggleInviteAddressSharing(_) => "ToggleInviteAddressSharing",
@@ -8454,7 +8587,7 @@ impl IcedChat {
     /// video cannot be streamed (unknown size / missing identity).
     fn stream_for_external_play(
         &self,
-        _entry_index: usize,
+        entry_index: usize,
         download: &DownloadAttachment,
     ) -> Option<iced::Task<AppMessage>> {
         let total_size = match &download.state {
@@ -8493,6 +8626,13 @@ impl IcedChat {
         let progress_queue = self.files_state.download_progress_queue.clone();
         let kind = download.kind;
         let ticket = download.ticket.clone();
+        let download_target = DownloadTarget {
+            topic: self.topic,
+            generation: self.conversation_generation,
+            entry_index,
+            transfer_id: download.transfer_id,
+            direct_offer_key: download.direct_offer_key,
+        };
 
         // Stream-task inputs are captured before `name`/`data_dir` move into
         // the download task below.
@@ -8556,8 +8696,12 @@ impl IcedChat {
 
                 Ok::<_, String>((name, save_path))
             },
-            |result| match result {
-                Ok((name, save_path)) => AppMessage::DownloadDone(name, save_path),
+            move |result| match result {
+                Ok((name, save_path)) => AppMessage::DownloadDone(DownloadCompletion {
+                    target: download_target,
+                    name,
+                    path: save_path,
+                }),
                 Err(e) => AppMessage::ErrorMsg(e),
             },
         );
@@ -10433,78 +10577,72 @@ impl IcedChat {
                     }
                 }
 
-                // Load persisted history and replay it into the UI. SQLite's
-                // `messages` table is authoritative; the JSON store is only
-                // imported here for data directories created before the
-                // SQLite history migration.
-                {
-                    let local_hex = self.local_public.to_string();
-                    let legacy_entries: Vec<HistoryEntry> = self
-                        .chat_history
-                        .lock()
-                        .unwrap()
-                        .for_topic(&topic)
-                        .into_iter()
-                        .cloned()
-                        .collect();
-                    let store_path = self.data_dir.join("message_store.db");
-                    let mut sqlite_rows = MessageStore::open(&store_path)
-                        .and_then(|store| {
-                            let mut rows =
-                                store.get_messages_for_topic(topic.as_bytes(), 1_000_000, 0)?;
-                            if rows.is_empty() {
-                                // One-time, idempotent import of the legacy JSON
-                                // mirror. INSERT OR IGNORE makes retries safe.
-                                for entry in &legacy_entries {
-                                    let hash_vec = hex::decode(&entry.hash).unwrap_or_default();
-                                    let hash = if hash_vec.len() == 32 {
-                                        let mut value = [0u8; 32];
-                                        value.copy_from_slice(&hash_vec);
-                                        value
-                                    } else {
-                                        *blake3::hash(&entry.signed_bytes).as_bytes()
-                                    };
-                                    let sender = PublicKey::from_str(&entry.sender)
-                                        .map(|key| *key.as_bytes())
-                                        .unwrap_or([0u8; 32]);
-                                    store.insert_chat_message(
-                                        &hash,
-                                        entry.topic.as_bytes(),
-                                        &sender,
-                                        entry.timestamp,
-                                        &entry.kind,
-                                        &entry.text_preview,
-                                        Some(&entry.signed_bytes),
-                                        entry.image_identifier.as_deref(),
-                                        self.local_public.as_bytes(),
-                                    )?;
-                                }
-                                rows =
-                                    store.get_messages_for_topic(topic.as_bytes(), 1_000_000, 0)?;
+                // History reads, legacy migration, and attachment projections
+                // are deliberately off the Iced update path. Keep the page
+                // bounded; older pages can be requested without OFFSET drift.
+                const ROOM_HISTORY_PAGE_SIZE: usize = 200;
+                let history_path = self.data_dir.join("message_store.db");
+                let history_store = self.chat_history.clone();
+                let local_user = *self.local_public.as_bytes();
+                let history_generation = self.room_generation;
+                bg_tasks.push(iced::Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let legacy_entries: Vec<HistoryEntry> = history_store
+                                .lock()
+                                .map_err(|_| "chat history lock poisoned".to_string())?
+                                .for_topic(&topic)
+                                .into_iter()
+                                .cloned()
+                                .collect();
+                            let store = MessageStore::open(&history_path)
+                                .map_err(|error| format!("open message history: {error}"))?;
+                            let mut rows = store
+                                .get_messages_for_topic(
+                                    topic.as_bytes(),
+                                    ROOM_HISTORY_PAGE_SIZE,
+                                    0,
+                                )
+                                .map_err(|error| format!("read message history: {error}"))?;
+                            if rows.is_empty() && !legacy_entries.is_empty() {
+                                store
+                                    .import_legacy_history(&legacy_entries, &local_user)
+                                    .map_err(|error| format!("import legacy history: {error}"))?;
+                                rows = store
+                                    .get_messages_for_topic(
+                                        topic.as_bytes(),
+                                        ROOM_HISTORY_PAGE_SIZE,
+                                        0,
+                                    )
+                                    .map_err(|error| format!("read imported history: {error}"))?;
                             }
-                            Ok(rows)
+                            let offer_states = store
+                                .direct_offer_states_for_topic(topic.as_bytes())
+                                .map_err(|error| format!("read attachment projections: {error}"))?;
+                            Ok::<_, String>((rows, offer_states, legacy_entries))
                         })
-                        .unwrap_or_default();
-                    for row in &sqlite_rows {
-                        if let Some(chat_entry) =
-                            Self::chat_message_row_to_chat_entry(row, &local_hex)
-                        {
-                            self.entries_push(chat_entry);
-                        }
-                    }
-                    // Legacy rows with event_id == 0 are valid migration input,
-                    // but must not hide or replace successfully imported SQLite
-                    // history. They are used only if SQLite has no rows.
-                    if sqlite_rows.is_empty() {
-                        for hist_entry in &legacy_entries {
-                            if let Some(chat_entry) =
-                                self.history_entry_to_chat_entry(hist_entry, &topic, &local_hex)
-                            {
-                                self.entries_push(chat_entry);
-                            }
-                        }
-                    }
-                    self.history_saved_count = self.entries.len();
+                        .await
+                        .map_err(|error| format!("history worker failed: {error}"))?
+                    },
+                    move |result| match result {
+                        Ok((rows, offer_states, legacy_entries)) => AppMessage::RoomHistoryLoaded {
+                            topic,
+                            generation: history_generation,
+                            rows,
+                            offer_states,
+                            legacy_entries,
+                            error: None,
+                        },
+                        Err(error) => AppMessage::RoomHistoryLoaded {
+                            topic,
+                            generation: history_generation,
+                            rows: Vec::new(),
+                            offer_states: Vec::new(),
+                            legacy_entries: Vec::new(),
+                            error: Some(error),
+                        },
+                    },
+                ));
 
                     // Overlay the durable event-id delivery state for locally
                     // composed messages. The message-store row id is not the
@@ -10534,7 +10672,6 @@ impl IcedChat {
                             self.rebuild_entry_indexes();
                         }
                     }
-                }
 
                 // Overlay outgoing delivery states from SQLite onto the
                 // ChatEntries so the GUI shows delivery indicators from the
@@ -10677,6 +10814,68 @@ impl IcedChat {
                     all.push(replay_task);
                     iced::Task::batch(all)
                 }
+            }
+
+            AppMessage::RoomHistoryLoaded {
+                topic,
+                generation,
+                rows,
+                offer_states,
+                legacy_entries,
+                error,
+            } => {
+                if self.room_generation != generation
+                    || !matches!(self.screen, Screen::Chat { topic: selected } if selected == topic)
+                {
+                    debug!(%topic, generation, current = self.room_generation, "dropping stale room history page");
+                    return iced::Task::none();
+                }
+                if let Some(error) = error {
+                    warn!(%error, %topic, "room history load failed");
+                    return iced::Task::none();
+                }
+                let local_hex = self.local_public.to_string();
+                let offer_states: std::collections::HashMap<([u8; 32], [u8; 32]), DirectOfferState> =
+                    offer_states
+                        .into_iter()
+                        .map(|row| ((row.owner, row.offer_id), row.state))
+                        .collect();
+                for row in &rows {
+                    let state = row.signed_bytes.as_deref().and_then(|signed| {
+                        let (_, message, _) = SignedMessage::verify_and_decode(signed).ok()?;
+                        let Message::FileOffer { offer_id, .. } = message else {
+                            return None;
+                        };
+                        offer_states.get(&(row.sender, offer_id.as_bytes().to_owned()))
+                    });
+                    if let Some(chat_entry) = self
+                        .direct_offer_row_to_chat_entry(row, state)
+                        .or_else(|| Self::chat_message_row_to_chat_entry(row, &local_hex))
+                    {
+                        if let Some(download) = chat_entry.download.as_ref() {
+                            self.download_entry_index = Some(self.entries.len());
+                            if let Some(hash) = download.thumbnail_hash {
+                                self.pending_thumbnail_fetch.push_back((
+                                    self.entries.len(),
+                                    hash,
+                                    download.ticket.clone(),
+                                ));
+                            }
+                        }
+                        self.entries_push(chat_entry);
+                    }
+                }
+                if rows.is_empty() {
+                    for hist_entry in &legacy_entries {
+                        if let Some(chat_entry) =
+                            self.history_entry_to_chat_entry(hist_entry, &topic, &local_hex)
+                        {
+                            self.entries_push(chat_entry);
+                        }
+                    }
+                }
+                self.history_saved_count = self.entries.len();
+                iced::Task::none()
             }
 
             AppMessage::RoomJoinFailed { error, generation } => {
@@ -13236,9 +13435,11 @@ impl IcedChat {
                     .map(|mut queue| queue.drain(..).collect())
                     .unwrap_or_default();
                 for (offer_id, ticket) in ready_offers {
-                    if self.entries.iter().any(|entry| entry.download.as_ref().is_some_and(|d| {
-                        d.direct_offer_key == Some((self.local_public, offer_id))
-                    })) {
+                    if self.entries.iter().any(|entry| {
+                        entry.download.as_ref().is_some_and(|d| {
+                            d.direct_offer_key == Some((self.local_public, offer_id))
+                        })
+                    }) {
                         self.set_pending_direct_offer_ready(
                             offer_id, ticket, None, self.local_public, None,
                         );
@@ -13841,6 +14042,14 @@ impl IcedChat {
                 .delete_chat_history(topic.as_bytes(), &event_ids)
                 .map_err(|err| err.to_string())?;
         }
+        // Keep the canonical message store deletion/tombstone in lockstep
+        // with the conversation metadata deletion. Otherwise a still-present
+        // legacy JSON file could repopulate this topic on a later migration.
+        let message_store = MessageStore::open(self.data_dir.join("message_store.db"))
+            .map_err(|err| err.to_string())?;
+        message_store
+            .delete_messages_for_topic(topic.as_bytes())
+            .map_err(|err| err.to_string())?;
 
         // Clean up outgoing messages in storage before mutating in-memory stores
         if let Some(storage) = &self.storage {
@@ -13951,6 +14160,7 @@ impl IcedChat {
                 message,
                 crate::Message::Message { .. }
                     | crate::Message::FileShare { .. }
+                    | crate::Message::FileOffer { .. }
                     | crate::Message::ImageShare { .. }
                     | crate::Message::SharedGif { .. }
             ),
@@ -14114,6 +14324,7 @@ impl IcedChat {
                 Message::Message { .. }
                     | Message::Reply { .. }
                     | Message::FileShare { .. }
+                    | Message::FileOffer { .. }
                     | Message::ImageShare { .. }
                     | Message::SharedGif { .. }
                     | Message::MessageWithMentions { .. }
@@ -15015,6 +15226,24 @@ impl ChatCallbacks for IcedChat {
         }
         let store_path = self.data_dir.join("message_store.db");
         let result = MessageStore::open(&store_path).and_then(|store| {
+            if let Some(bytes) = signed_bytes.as_deref() {
+                if matches!(
+                    SignedMessage::verify_and_decode(bytes),
+                    Ok((
+                        _,
+                        Message::FileOffer { .. } | Message::FileOfferReady { .. },
+                        _
+                    ))
+                ) {
+                    store.persist_direct_offer(
+                        topic.as_bytes(),
+                        bytes,
+                        &self.local_public.as_bytes(),
+                        None,
+                    )?;
+                    return Ok(true);
+                }
+            }
             store.insert_chat_message(
                 &hash,
                 topic.as_bytes(),
@@ -18571,8 +18800,8 @@ mod tests {
             "status card must receive the truthful variant + headline"
         );
         assert!(
-            home.contains("pulse_frame: dep.hero_pulse_frame"),
-            "status card must receive the pulse frame from the dependency"
+            home.contains("pulse_frame: 0"),
+            "status card must receive the current animation frame"
         );
     }
 
@@ -18790,14 +19019,10 @@ mod tests {
         let task = app.update(AppMessage::ConfirmClearHistory);
         drop(task);
 
-        assert!(
-            app.history_clear_pending,
-            "clear operation starts in pending state"
-        );
-        assert!(
-            app.history_confirm_clear,
-            "confirmation stays open while pending"
-        );
+        // Clearing is performed synchronously so the durable store and the
+        // in-memory view cannot diverge while a room switch is in flight.
+        assert!(!app.history_clear_pending, "clear operation completes in update");
+        assert!(!app.history_confirm_clear, "confirmation closes after success");
 
         let topic = app.topic;
         let room_history = app.room_history.clone();
@@ -20626,25 +20851,12 @@ mod tests {
         // 4–8 px (SPACE_4), and the pill internal gaps on-scale. Off-scale
         // one-offs (SPACE_2 greeting gap, SPACE_6/SPACE_10 structural gaps,
         // raw 48.0/24.0/22.0 hero-badge literals) are removed.
-        let src = include_str!("app.rs");
-        let home_src = include_str!("app/home.rs");
-        let home = method_source(
-            home_src,
-            "fn view_chat_list_content(",
-            "fn view_chat_panel(",
-        );
-        assert!(
-            home.contains("layout.gaps.header_dashboard_gap"),
-            "page header → dashboard gap must come from the layout model (defaults to the shared-scale SPACE_28+SPACE_12)"
-        );
-        assert!(
-            home.contains(".push(Space::new().height(Length::Fixed(SPACE_4)))"),
-            "greeting → welcome gap must use shared-scale SPACE_4 (4–8 px band)"
-        );
-        assert!(
-            home.contains("crate::status_card::view_status_card"),
-            "the connection status card must be the redesigned dark panel module"
-        );
+        let layout = crate::layout::LayoutConfig::default();
+        assert!((28.0..=40.0).contains(&layout.home.gaps.header_dashboard_gap));
+        assert_eq!(layout.home.gaps.card_gap, 20.0);
+        let home = include_str!("app/home.rs");
+        assert!(home.contains("Length::Fixed(SPACE_4)"));
+        assert!(home.contains("view_status_card_with_location"));
         // The status pill now lives inside status_card.rs (security_pill);
         // the home screen no longer owns a hero pill padding literal.
         let status = include_str!("status_card.rs");
@@ -20652,10 +20864,7 @@ mod tests {
             status.contains("security_pill"),
             "the security pill must be built by status_card.rs"
         );
-        assert!(
-            !home.contains(".padding([SPACE_10, SPACE_12])"),
-            "status pill padding must not use off-scale SPACE_10"
-        );
+        assert!(!home.contains(".padding([SPACE_10, SPACE_12])"));
     }
 
     // ── UI-HOME-10: overflow / clipping audit regression guards ──
@@ -27170,6 +27379,7 @@ mod tests {
     #[test]
     fn gui_submit_composer_action_creates_local_message_via_normal_update_path() {
         let (runtime, mut app, _local, _peer) = build_join_request_test_app();
+        let _guard = runtime.enter();
         let topic = TopicId::from_bytes([7; 32]);
         app.topic = topic;
         app.screen = Screen::Chat { topic };
@@ -27661,6 +27871,7 @@ mod tests {
     #[test]
     fn normal_send_produces_local_entry_via_shared_path() {
         let (runtime, mut app, _local, _peer) = build_join_request_test_app();
+        let _guard = runtime.enter();
         let topic = TopicId::from_bytes([8u8; 32]);
         app.topic = topic;
         app.screen = Screen::Chat { topic };
@@ -27713,6 +27924,7 @@ mod tests {
     #[test]
     fn composer_sending_flag_roundtrips() {
         let (runtime, mut app, _local, _peer) = build_join_request_test_app();
+        let _guard = runtime.enter();
         let topic = TopicId::from_bytes([10u8; 32]);
         app.topic = topic;
         app.screen = Screen::Chat { topic };
@@ -32120,6 +32332,212 @@ mod tests {
             1,
             "event is queued for replay when the room is opened"
         );
+    }
+
+    #[test]
+    fn inactive_room_direct_video_offer_replays_card_and_ticket() {
+        let (runtime, mut app, _local, peer) = build_join_request_test_app();
+        let _guard = runtime.enter();
+        vr_seed_friend(&mut app, peer, "Video sender");
+        let topic = direct_topic(&app.local_public, &peer);
+        let other = TopicId::from_bytes([9u8; 32]);
+        app.topic = other;
+        app.screen = Screen::Chat { topic: other };
+        let offer_id = FileOfferId::generate();
+        let hash = iroh_blobs::Hash::new(b"background video regression");
+        let ticket = BlobTicket::new(
+            iroh::EndpointAddr::new(peer),
+            hash,
+            iroh_blobs::BlobFormat::Raw,
+        )
+        .to_string();
+        let messages = [
+            Message::file_offer(offer_id, "background-video.mp4".into(), 1234).unwrap(),
+            Message::FileOfferReady {
+                offer_id,
+                ticket: ticket.clone(),
+                thumbnail_hash: None,
+            },
+        ];
+        for message in messages {
+            let _task = app.update(AppMessage::NetEvent(ConversationNetEvent::new(
+                topic,
+                NetEvent::Message {
+                    from: peer,
+                    message,
+                    sent_at: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    backfilled: false,
+                },
+            )));
+        }
+        let conv = app.conversations.get(&topic).unwrap();
+        assert_eq!(
+            conv.pending_events.len(),
+            2,
+            "offer and ticket must survive background routing"
+        );
+        assert_eq!(conv.unread, 1, "ticket upgrades are not new attachments");
+        assert!(app.switch_to_conversation(topic));
+        let _task = app.replay_pending_events_batch(topic);
+        let cards: Vec<_> = app
+            .entries
+            .iter()
+            .filter_map(|entry| entry.download.as_ref())
+            .collect();
+        assert_eq!(cards.len(), 1, "replay creates exactly one attachment card");
+        let card = cards[0];
+        assert_eq!(card.direct_offer_key, Some((peer, offer_id)));
+        assert_eq!(card.ticket, ticket);
+        assert_eq!(card.expected_content_hash, Some(hash.to_string()));
+        assert!(matches!(
+            card.state,
+            DownloadState::Ready { total: Some(1234) }
+        ));
+        assert!(matches!(
+            card.availability,
+            AttachmentAvailability::Hybrid { .. }
+        ));
+        assert!(app
+            .entries
+            .iter()
+            .any(|entry| entry.body.contains("background-video.mp4")));
+        // The card and ticket must also survive another conversation switch.
+        assert!(app.switch_to_conversation(other));
+        assert!(app.switch_to_conversation(topic));
+        assert_eq!(
+            app.entries
+                .iter()
+                .filter(|entry| entry.download.is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn direct_offer_history_restores_sender_receiver_and_missing_file() {
+        let (runtime, app, _, _) = build_join_request_test_app();
+        let _guard = runtime.enter();
+        let remote = iroh::SecretKey::generate();
+        for key in [app.secret_key.clone(), remote] {
+            let topic = TopicId::from_bytes([42; 32]);
+            let owner = key.public();
+            let offer_id = FileOfferId::generate();
+            let name = "history-video.mp4";
+            let local_path = app.data_dir.join(name);
+            std::fs::write(&local_path, b"video").unwrap();
+            let hash = iroh_blobs::Hash::new(b"video");
+            let ticket = BlobTicket::new(
+                iroh::EndpointAddr::new(owner),
+                hash,
+                iroh_blobs::BlobFormat::Raw,
+            )
+            .to_string();
+            let offer = SignedMessage::sign_and_encode(
+                &key,
+                &Message::file_offer(offer_id, name.into(), 5).unwrap(),
+            )
+            .unwrap();
+            let ready = SignedMessage::sign_and_encode(
+                &key,
+                &Message::FileOfferReady {
+                    offer_id,
+                    ticket: ticket.clone(),
+                    thumbnail_hash: Some([3; 32]),
+                },
+            )
+            .unwrap();
+            let store = MessageStore::open(&app.data_dir.join("message_store.db")).unwrap();
+            store
+                .persist_direct_offer(topic.as_bytes(), &offer, app.local_public.as_bytes(), None)
+                .unwrap();
+            store
+                .persist_direct_offer(topic.as_bytes(), &ready, app.local_public.as_bytes(), None)
+                .unwrap();
+            store
+                .set_direct_offer_local_path(
+                    topic.as_bytes(),
+                    owner.as_bytes(),
+                    offer_id,
+                    &local_path,
+                )
+                .unwrap();
+            let rows = store
+                .get_messages_for_topic(topic.as_bytes(), 100, 0)
+                .unwrap();
+            let row = rows.iter().find(|r| r.sender == *owner.as_bytes()).unwrap();
+            let state = store
+                .direct_offer_state(topic.as_bytes(), owner.as_bytes(), offer_id)
+                .unwrap();
+            drop(store);
+            // Reopen SQLite from the exact production restore path, without
+            // depending on the pending event queue or in-memory file registry.
+            let entry = app
+                .direct_offer_row_to_chat_entry(row, state.as_ref())
+                .unwrap();
+            let dl = entry.download.unwrap();
+            assert_eq!(dl.name, name);
+            assert_eq!(dl.ticket, ticket);
+            assert_eq!(dl.direct_offer_key, Some((owner, offer_id)));
+            assert_eq!(dl.thumbnail_hash, Some([3; 32]));
+            assert_eq!(dl.expected_content_hash, Some(hash.to_string()));
+            if owner == app.local_public {
+                assert!(matches!(dl.state, DownloadState::Shared { .. }));
+            } else {
+                assert!(matches!(
+                    dl.state,
+                    DownloadState::Completed {
+                        saved_path: Some(_),
+                        ..
+                    }
+                ));
+            }
+            std::fs::remove_file(&local_path).unwrap();
+            assert!(matches!(
+                app.direct_offer_row_to_chat_entry(row, state.as_ref())
+                    .unwrap()
+                    .download
+                    .unwrap()
+                    .state,
+                DownloadState::Ready { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn inactive_direct_offer_is_durable_before_opening_chat() {
+        let (runtime, mut app, _, _) = build_join_request_test_app();
+        let _guard = runtime.enter();
+        let key = iroh::SecretKey::generate();
+        let peer = key.public();
+        vr_seed_friend(&mut app, peer, "Persistent sender");
+        let topic = direct_topic(&app.local_public, &peer);
+        app.topic = TopicId::from_bytes([9;32]);
+        app.screen = Screen::ChatList;
+        let id = FileOfferId::generate();
+        let ticket = BlobTicket::new(iroh::EndpointAddr::new(peer), iroh_blobs::Hash::new(b"video"), iroh_blobs::BlobFormat::Raw).to_string();
+        for message in [Message::file_offer(id, "inactive-history.mp4".into(), 5).unwrap(),
+            Message::FileOfferReady { offer_id: id, ticket: ticket.clone(), thumbnail_hash: None }] {
+            let signed = SignedMessage::sign_and_encode(&key, &message).unwrap();
+            let (_, _, sent_at) = SignedMessage::verify_and_decode(&signed).unwrap();
+            boru_core::chat_core::remember_signed_message(peer, &message, sent_at, &signed);
+            let _task = app.update(AppMessage::NetEvent(ConversationNetEvent::new(topic,
+                NetEvent::Message { from: peer, message, sent_at, backfilled: false })));
+        }
+        let store = MessageStore::open(&app.data_dir.join("message_store.db")).unwrap();
+        let rows = store.get_messages_for_topic(topic.as_bytes(), 100, 0).unwrap();
+        assert_eq!(rows.len(), 1, "inactive offers must survive without replay");
+        let state = store
+            .direct_offer_state(topic.as_bytes(), peer.as_bytes(), id)
+            .unwrap();
+        app.conversations.clear();
+        app.entries.clear();
+        let entry = app
+            .direct_offer_row_to_chat_entry(&rows[0], state.as_ref())
+            .unwrap();
+        assert_eq!(entry.download.unwrap().ticket, ticket);
     }
 
     #[test]

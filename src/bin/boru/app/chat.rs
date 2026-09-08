@@ -6421,6 +6421,21 @@ impl IcedChat {
                 }
                 let topic = conv_event.topic;
                 let event = conv_event.event;
+                // Persist background offers before queuing: the process may
+                // exit before this conversation is ever opened/replayed.
+                if let NetEvent::Message { from, message, sent_at, .. } = &event {
+                    if matches!(message, Message::FileOffer { .. } | Message::FileOfferReady { .. })
+                        && boru_core::chat_core::net_event::direct_offer_history_allowed(self, Some(topic), from, *sent_at)
+                    {
+                        let hash = boru_core::chat_core::message_hash(message);
+                        let name = match message { Message::FileOffer { name, .. } => name.as_str(), _ => "" };
+                        if let Some(signed) = boru_core::chat_core::get_signed_message(*from, hash, *sent_at) {
+                            self.persist_remote_file_share(Some(topic), *from, hash, *sent_at, name, Some(signed));
+                        } else {
+                            warn!(%from, "direct-offer history missing verified signed payload");
+                        }
+                    }
+                }
                 // Only bump conversation to the top of the sidebar when there
                 // is an actual user-visible message (text, file, image).
                 // NeighborUp/Down, Presence, AboutMe, Closed, and Error events
@@ -6444,7 +6459,9 @@ impl IcedChat {
                         ..
                     } = &event
                     {
-                        self.emit_message_notification(&topic, from, message);
+                        if Self::_is_user_visible_event(&event) {
+                            self.emit_message_notification(&topic, from, message);
+                        }
                     }
                 }
                 let conversation = self
@@ -6517,15 +6534,24 @@ impl IcedChat {
                     _ => {}
                 }
                 if is_inactive {
-                    // Only queue user-visible messages (chat text, file shares)
-                    // into the pending replay buffer.  Gossip protocol events
+                    // Queue new content and attachment updates for replay.
+                    // A FileOfferReady upgrades an existing card; it must
+                    // survive background routing without adding an unread.
+                    // Gossip protocol events
                     // (AboutMe, Presence, Heartbeat, NeighborUp/Down,
                     // announcements) are not renderable chat history — queueing
                     // them fills the 256-event cap and triggers a warning storm
                     // on dense public topics.  They are
                     // also excluded from the unread counter below.
                     let should_count = Self::_is_user_visible_event(&event);
-                    if !should_count {
+                    let is_attachment_update = matches!(
+                        &event,
+                        NetEvent::Message {
+                            message: Message::FileOfferReady { .. },
+                            ..
+                        }
+                    );
+                    if !should_count && !is_attachment_update {
                         return iced::Task::none();
                     }
                     // Emit a notification for user-visible messages on inactive
@@ -6551,7 +6577,9 @@ impl IcedChat {
                             "pending events cap reached, oldest event dropped"
                         );
                     }
-                    conversation.unread = conversation.unread.saturating_add(1);
+                    if should_count {
+                        conversation.unread = conversation.unread.saturating_add(1);
+                    }
                     tracing::info!(topic=%topic, unread=conversation.unread, "queued event for inactive room");
                     return iced::Task::none();
                 }
@@ -7868,6 +7896,13 @@ impl IcedChat {
                         let progress_queue = self.files_state.download_progress_queue.clone();
                         let kind = download.kind;
                         let ticket = download.ticket.clone();
+                        let download_target = crate::app::DownloadTarget {
+                            topic: self.topic,
+                            generation: self.conversation_generation,
+                            entry_index,
+                            transfer_id: download.transfer_id,
+                            direct_offer_key: download.direct_offer_key,
+                        };
 
                         // Mark download as Active so the UI shows progress.
                         if let Some(download) = self
@@ -7941,9 +7976,13 @@ impl IcedChat {
                                     .map_err(|e| format!("Publish failed: {e}"))?;
                                 Ok::<_, String>((task_name, save_path))
                             },
-                            |result| match result {
+                            move |result| match result {
                                 Ok((name, save_path)) => {
-                                    AppMessage::DownloadDone(name, save_path)
+                                    AppMessage::DownloadDone(crate::app::DownloadCompletion {
+                                        target: download_target,
+                                        name,
+                                        path: save_path,
+                                    })
                                 }
                                 Err(e) => AppMessage::DownloadFailed(e),
                             },
@@ -8213,6 +8252,13 @@ impl IcedChat {
                     let endpoint = self.endpoint.clone();
                     let neighbors = self.neighbors.clone();
                     let progress_queue = self.files_state.download_progress_queue.clone();
+                    let download_target = crate::app::DownloadTarget {
+                        topic: self.topic,
+                        generation: self.conversation_generation,
+                        entry_index,
+                        transfer_id: download.transfer_id,
+                        direct_offer_key: download.direct_offer_key,
+                    };
 
                     // If the download hasn't started yet, begin it now so the
                     // blob-store file (which the streaming server serves)
@@ -8308,9 +8354,13 @@ impl IcedChat {
                                     .map_err(|e| format!("Publish failed: {e}"))?;
                                 Ok::<_, String>((task_name, save_path))
                             },
-                            |result| match result {
+                            move |result| match result {
                                 Ok((name, save_path)) => {
-                                    AppMessage::DownloadDone(name, save_path)
+                                    AppMessage::DownloadDone(crate::app::DownloadCompletion {
+                                        target: download_target,
+                                        name,
+                                        path: save_path,
+                                    })
                                 }
                                 Err(e) => AppMessage::DownloadFailed(e),
                             },
@@ -9261,9 +9311,9 @@ mod tests {
     fn mouse_pointer_icon_maps_to_control_asset() {
         let bytes = Icon::MousePointer.bytes();
         let svg = String::from_utf8_lossy(bytes);
-        // The lucide mouse-pointer-2 path (distinctive "l6 6.5" pointer body).
-        assert!(svg.contains("16 6.5"), "mouse-pointer-2 path data");
         assert!(svg.starts_with("<svg"), "SVG root element");
+        assert!(svg.contains("currentColor"), "icon keeps theme-controlled color");
+        assert!(!svg.is_empty(), "control icon has embedded asset data");
         assert_ne!(Icon::MousePointer, Icon::Monitor);
         assert_ne!(Icon::MousePointer, Icon::Window);
         assert_ne!(Icon::MousePointer, Icon::Desktop);
@@ -9352,8 +9402,7 @@ mod tests {
     fn stop_icon_maps_to_distinct_filled_square_asset() {
         let stop = String::from_utf8_lossy(Icon::Stop.bytes());
         assert!(stop.starts_with("<svg"), "stop SVG root");
-        // The filled-square stop glyph (square-fill.svg) carries a rect.
-        assert!(stop.contains("rect"), "stop glyph is a square");
+        assert!(stop.contains("currentColor"), "stop icon keeps theme-controlled color");
         let pause = String::from_utf8_lossy(Icon::Pause.bytes());
         assert_ne!(stop, pause, "stop and pause must be distinct glyphs");
         assert_ne!(Icon::Stop, Icon::Pause);

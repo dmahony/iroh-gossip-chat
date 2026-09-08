@@ -202,6 +202,8 @@ impl super::MessageStore {
             [conversation_id.as_slice()],
         )
         .std_context("hard delete chat history messages")?;
+        tx.execute("DELETE FROM direct_offer_state WHERE topic=?1", [conversation_id.as_slice()])
+            .std_context("hard delete direct offer state")?;
 
         // Delete corresponding outbox rows
         let mut delete_outbox = tx

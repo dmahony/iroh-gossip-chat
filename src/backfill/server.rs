@@ -25,7 +25,7 @@ use super::{
     SERVER_BACKFILL_BYTE_CAP, SERVER_MAX_BACKFILL,
 };
 use crate::backfill::authorizer::BackfillAuthorizer;
-use crate::storage::Storage;
+use crate::{storage::Storage, store::MessageStore};
 
 // ── Protocol handler (server side) ─────────────────────────────────────────────
 
@@ -38,8 +38,9 @@ use crate::storage::Storage;
 /// ```
 #[derive(Debug, Clone)]
 pub struct BackfillProtocolHandler {
-    /// Shared storage — used to respond to backfill requests.
-    storage: Arc<Storage>,
+    /// Message history shared with local replay and search.
+    message_store: MessageStore,
+
     /// Centralized authorization for incoming requests.
     authorizer: BackfillAuthorizer,
     /// Per-peer rate-limiting state.
@@ -55,10 +56,14 @@ impl BackfillProtocolHandler {
     /// `local_public` is this node's own public key — it anchors the
     /// direct-chat authorization check ([`direct_topic`]) and is never
     /// taken from a request.
-    pub fn new(storage: Arc<Storage>, local_public: PublicKey) -> Self {
+    pub fn new(
+        message_store: MessageStore,
+        storage: Arc<Storage>,
+        local_public: PublicKey,
+    ) -> Self {
         Self {
             authorizer: BackfillAuthorizer::new(storage.clone(), local_public),
-            storage,
+            message_store,
             rate_limit: Arc::new(Mutex::new(BackfillRateLimit::default())),
             backfill_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_BACKFILLS)),
         }
@@ -87,7 +92,7 @@ impl ProtocolHandler for BackfillProtocolHandler {
             }
         };
 
-        let store = self.storage.clone();
+        let message_store = self.message_store.clone();
         let authorizer = self.authorizer.clone();
         let rate_limit = self.rate_limit.clone();
 
@@ -109,7 +114,7 @@ impl ProtocolHandler for BackfillProtocolHandler {
                 }
             }
 
-            let result = serve_backfill(connection, &store, &authorizer).await;
+            let result = serve_backfill(connection, &message_store, &authorizer).await;
 
             // Always release the rate limit slot.
             rate_limit.lock().unwrap().release(&remote_id);
@@ -140,7 +145,7 @@ impl ProtocolHandler for BackfillProtocolHandler {
 /// that does not reveal whether the topic exists or how much history it has.
 pub(crate) async fn serve_backfill(
     connection: Connection,
-    storage: &Storage,
+    message_store: &MessageStore,
     authorizer: &BackfillAuthorizer,
 ) -> Result<()> {
     // Enforce a hard timeout on the entire backfill exchange.
@@ -219,29 +224,34 @@ pub(crate) async fn serve_backfill(
             // Determine the total available count for accurate `skipped`.
             // SQLite read — run on the blocking pool so the QUIC accept
             // worker is never stalled (BORU-AUDIT-18).
-            let total_available = storage
-                .run_blocking("backfill.count_messages", {
-                    let topic = topic;
-                    move |s| {
-                        s.count_chat_messages_for_topic(&topic)
-                            .map_err(|e| anyhow::anyhow!("{e:#}"))
-                    }
-                })
-                .await
-                .unwrap_or(0);
+            let count_store = message_store.clone();
+            let count_topic = topic;
+            let total_available = tokio::task::spawn_blocking(move || {
+                count_store
+                    .count_signed_messages_for_topic(count_topic.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("{e:#}"))
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(0);
 
             // Collect entries — bounded topic query only; the unscoped
             // recent-history query is never reachable from the network.
-            let entries: Vec<_> = storage
-                .run_blocking("backfill.recent_messages", {
-                    let topic = topic;
-                    move |s| {
-                        s.get_recent_chat_messages_for_topic(&topic, max_messages as usize)
-                            .map_err(|e| anyhow::anyhow!("{e:#}"))
-                    }
-                })
-                .await
-                .unwrap_or_default()
+            let recent_store = message_store.clone();
+            let recent_topic = topic;
+            let entries: Vec<_> = tokio::task::spawn_blocking(move || {
+                recent_store
+                    .get_recent_signed_messages_for_topic(
+                        recent_topic.as_bytes(),
+                        max_messages as usize,
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e:#}"))
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
                 .into_iter()
                 .map(|(ts, bytes)| (ts, bytes))
                 .collect();
