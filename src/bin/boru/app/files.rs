@@ -7108,6 +7108,13 @@ impl IcedChat {
                 let data_dir = self.data_dir.clone();
                 let history_topic = self.topic;
                 let direct_offer_key = dl.direct_offer_key;
+                let download_target = crate::app::DownloadTarget {
+                    topic: self.topic,
+                    generation: self.conversation_generation,
+                    entry_index,
+                    transfer_id: dl.transfer_id,
+                    direct_offer_key,
+                };
                 let progress_queue = self.files_state.download_progress_queue.clone();
                 iced::Task::perform(
                     async move {
@@ -7209,7 +7216,11 @@ impl IcedChat {
                                 "Skipped — {name} already exists (overwrite policy is Skip)."
                             ))
                         }
-                        Ok((name, path, _)) => AppMessage::DownloadDone(name, path),
+                        Ok((name, path, _)) => AppMessage::DownloadDone(crate::app::DownloadCompletion {
+                            target: download_target,
+                            name,
+                            path,
+                        }),
                         Err(e) => AppMessage::DownloadFailed(e),
                     },
                 )
@@ -7290,24 +7301,34 @@ impl IcedChat {
                 self.push_system(format!("Sharing: {name}"));
                 iced::Task::none()
             }
-            AppMessage::DownloadDone(name, path) => {
+            AppMessage::DownloadDone(completion) => {
+                let crate::app::DownloadCompletion { target, name, path } = completion;
                 tracing::info!(%name, path=%path.display(), "DownloadDone received");
                 self.push_system(format!("*{name}* is complete"));
                 let poster_path = path.clone();
                 let mut is_video = false;
+                // A completion belongs to the room and generation captured
+                // when the task started.  A stale completion must never use
+                // the current room's row index as a fallback.
+                if target.topic != self.topic || target.generation != self.conversation_generation {
+                    tracing::info!(?target, current_topic=%self.topic, current_generation=self.conversation_generation, "ignoring stale download completion");
+                    return iced::Task::none();
+                }
                 let completed_idx = self
                     .entries
                     .iter()
                     .position(|entry| {
                         entry.download.as_ref().is_some_and(|download| {
                             download.name == name
+                                && download.direct_offer_key == target.direct_offer_key
+                                && download.transfer_id == target.transfer_id
                                 && matches!(
                                     download.state,
                                     DownloadState::Active { .. } | DownloadState::Completed { .. }
                                 )
                         })
                     })
-                    .or(self.download_entry_index);
+                    .filter(|idx| *idx == target.entry_index);
                 tracing::info!(
                     idx=?completed_idx,
                     download_entry_index=?self.download_entry_index,
@@ -7353,7 +7374,7 @@ impl IcedChat {
                                 )
                                 .and_then(|store| {
                                     store.set_direct_offer_local_path(
-                                        self.topic.as_bytes(),
+                                        target.topic.as_bytes(),
                                         &owner.as_bytes(),
                                         offer_id,
                                         &path,
@@ -8934,6 +8955,13 @@ impl IcedChat {
                     }
                 }
 
+                let download_target = crate::app::DownloadTarget {
+                    topic: self.topic,
+                    generation: self.conversation_generation,
+                    entry_index: self.download_entry_index.unwrap_or_default(),
+                    transfer_id: None,
+                    direct_offer_key: None,
+                };
                 let blob_store = self.blob_store.clone();
                 let endpoint = self.endpoint.clone();
                 let neighbors = self.neighbors.clone();
@@ -8990,9 +9018,11 @@ impl IcedChat {
                         Ok::<_, String>((name, save_path))
                     },
                     move |r| match r {
-                        Ok((name, path)) => {
-                            AppMessage::DownloadDone(name, path)
-                        }
+                        Ok((name, path)) => AppMessage::DownloadDone(crate::app::DownloadCompletion {
+                            target: download_target,
+                            name,
+                            path,
+                        }),
                         Err(e) => AppMessage::DownloadFailed(e),
                     },
                 )

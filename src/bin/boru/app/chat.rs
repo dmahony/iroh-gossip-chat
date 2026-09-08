@@ -7896,6 +7896,13 @@ impl IcedChat {
                         let progress_queue = self.files_state.download_progress_queue.clone();
                         let kind = download.kind;
                         let ticket = download.ticket.clone();
+                        let download_target = crate::app::DownloadTarget {
+                            topic: self.topic,
+                            generation: self.conversation_generation,
+                            entry_index,
+                            transfer_id: download.transfer_id,
+                            direct_offer_key: download.direct_offer_key,
+                        };
 
                         // Mark download as Active so the UI shows progress.
                         if let Some(download) = self
@@ -7969,9 +7976,13 @@ impl IcedChat {
                                     .map_err(|e| format!("Publish failed: {e}"))?;
                                 Ok::<_, String>((task_name, save_path))
                             },
-                            |result| match result {
+                            move |result| match result {
                                 Ok((name, save_path)) => {
-                                    AppMessage::DownloadDone(name, save_path)
+                                    AppMessage::DownloadDone(crate::app::DownloadCompletion {
+                                        target: download_target,
+                                        name,
+                                        path: save_path,
+                                    })
                                 }
                                 Err(e) => AppMessage::DownloadFailed(e),
                             },
@@ -8241,6 +8252,13 @@ impl IcedChat {
                     let endpoint = self.endpoint.clone();
                     let neighbors = self.neighbors.clone();
                     let progress_queue = self.files_state.download_progress_queue.clone();
+                    let download_target = crate::app::DownloadTarget {
+                        topic: self.topic,
+                        generation: self.conversation_generation,
+                        entry_index,
+                        transfer_id: download.transfer_id,
+                        direct_offer_key: download.direct_offer_key,
+                    };
 
                     // If the download hasn't started yet, begin it now so the
                     // blob-store file (which the streaming server serves)
@@ -8336,9 +8354,13 @@ impl IcedChat {
                                     .map_err(|e| format!("Publish failed: {e}"))?;
                                 Ok::<_, String>((task_name, save_path))
                             },
-                            |result| match result {
+                            move |result| match result {
                                 Ok((name, save_path)) => {
-                                    AppMessage::DownloadDone(name, save_path)
+                                    AppMessage::DownloadDone(crate::app::DownloadCompletion {
+                                        target: download_target,
+                                        name,
+                                        path: save_path,
+                                    })
                                 }
                                 Err(e) => AppMessage::DownloadFailed(e),
                             },

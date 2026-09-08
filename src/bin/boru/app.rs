@@ -1998,6 +1998,28 @@ pub struct RoomSnapshot {
     pub generation: u64,
 }
 
+/// Immutable identity captured when an attachment download starts.
+/// Completion must not resolve against the currently selected room or a
+/// recycled row index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DownloadTarget {
+    pub(crate) topic: TopicId,
+    pub(crate) generation: u64,
+    pub(crate) entry_index: usize,
+    pub(crate) transfer_id: Option<TransferId>,
+    pub(crate) direct_offer_key: Option<(
+        PublicKey,
+        boru_core::chat_core::protocol::FileOfferId,
+    )>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DownloadCompletion {
+    pub(crate) target: DownloadTarget,
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+}
+
 // ── Per-conversation runtime state ─────────────────────────────────────
 
 /// Runtime state for a single live conversation (active or background).
@@ -4216,7 +4238,7 @@ pub enum AppMessage {
     RetryOutgoingMessage(u64),
     MessageSent(String, u64, MessageHash),
     FileSent(String),
-    DownloadDone(String, PathBuf),
+    DownloadDone(DownloadCompletion),
     /// File downloaded from a peer's shared profile — carries the saved path
     /// for the "Open" button.
     DownloadDonePeerFile(String, PathBuf),
@@ -8561,7 +8583,7 @@ impl IcedChat {
     /// video cannot be streamed (unknown size / missing identity).
     fn stream_for_external_play(
         &self,
-        _entry_index: usize,
+        entry_index: usize,
         download: &DownloadAttachment,
     ) -> Option<iced::Task<AppMessage>> {
         let total_size = match &download.state {
@@ -8600,6 +8622,13 @@ impl IcedChat {
         let progress_queue = self.files_state.download_progress_queue.clone();
         let kind = download.kind;
         let ticket = download.ticket.clone();
+        let download_target = DownloadTarget {
+            topic: self.topic,
+            generation: self.conversation_generation,
+            entry_index,
+            transfer_id: download.transfer_id,
+            direct_offer_key: download.direct_offer_key,
+        };
 
         // Stream-task inputs are captured before `name`/`data_dir` move into
         // the download task below.
@@ -8663,8 +8692,12 @@ impl IcedChat {
 
                 Ok::<_, String>((name, save_path))
             },
-            |result| match result {
-                Ok((name, save_path)) => AppMessage::DownloadDone(name, save_path),
+            move |result| match result {
+                Ok((name, save_path)) => AppMessage::DownloadDone(DownloadCompletion {
+                    target: download_target,
+                    name,
+                    path: save_path,
+                }),
                 Err(e) => AppMessage::ErrorMsg(e),
             },
         );
