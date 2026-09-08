@@ -1,6 +1,8 @@
 //! Bounded, content-addressed poster generation for verified local videos.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
 /// Maximum encoded poster size kept in the local cache.
 pub const MAX_POSTER_BYTES: usize = 512 * 1024;
@@ -113,7 +115,8 @@ fn generate_inner(
     }
 
     std::fs::create_dir_all(cache_dir).map_err(|e| format!("create poster cache: {e}"))?;
-    let output = std::process::Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    command
         // `-autorotate` is an INPUT option in ffmpeg >= 6: it must precede
         // `-i`, otherwise ffmpeg exits 234 ("cannot be applied to output
         // url") and the poster probe fails on every call.
@@ -132,14 +135,15 @@ fn generate_inner(
             "80",
             "-threads",
             "1",
-            "-timelimit",
-            "10",
             "-v",
             "error",
             "-",
-        ])
-        .output()
-        .map_err(|e| format!("start ffmpeg: {e}"))?;
+        ]);
+    let output = crate::video_playback::run_command_with_timeout(
+        &mut command,
+        Duration::from_secs(10),
+        "ffmpeg",
+    )?;
     if !output.status.success() || output.stdout.is_empty() {
         let detail = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ffmpeg poster probe failed: {}", detail.trim()));
