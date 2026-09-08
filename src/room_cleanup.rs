@@ -123,6 +123,35 @@ pub fn clear_room_history(
     Ok(report)
 }
 
+/// Permanently clear one conversation's persisted local history, keeping the room.
+///
+/// Durable deletion must succeed before runtime history is removed. The two
+/// databases cannot share a transaction; failures are propagated and retries
+/// are safe. Downloaded/shared file objects are deliberately retained.
+pub fn clear_persisted_room_history(
+    data_dir: impl AsRef<Path>,
+    topic: TopicId,
+    room_history: &mut RoomHistoryStore,
+    chat_history: &mut ChatHistoryStore,
+    storage: Option<&crate::storage::Storage>,
+) -> Result<RoomHistoryClearReport> {
+    let store = crate::store::MessageStore::open(data_dir.as_ref().join("message_store.db"))?;
+    let event_ids = chat_history
+        .for_topic(&topic)
+        .into_iter()
+        .map(|entry| entry.event_id)
+        .collect::<Vec<_>>();
+    if let Some(storage) = storage {
+        storage.delete_chat_history(topic.as_bytes(), &event_ids)?;
+        storage.delete_outgoing_for_topic(&topic)?;
+    }
+    let persisted = store.count_messages_for_topic(topic.as_bytes())?;
+    store.hard_delete_conversation(topic.as_bytes())?;
+    let mut report = clear_room_history(topic, room_history, chat_history, None)?;
+    report.chat_entries_removed = report.chat_entries_removed.max(persisted);
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +331,101 @@ mod tests {
             .is_some());
         assert!(!dir.join(ROOM_FILE_NAME).exists());
         assert!(!dir.join(ROOM_HISTORY_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn persisted_clear_survives_reopen_and_preserves_other_chat() {
+        let dir = temp_dir("clear_reopen");
+        fs::create_dir_all(&dir).unwrap();
+        let target = topic(11);
+        let other = topic(12);
+        let path = dir.join("message_store.db");
+        let mut rooms = RoomHistoryStore::empty_at(&dir);
+        rooms.upsert(target, "Target", true);
+        let mut history = ChatHistoryStore::empty_at(&dir);
+        {
+            let store = crate::store::MessageStore::open(&path).unwrap();
+            for (id, topic) in [(1u8, target), (2, other)] {
+                store
+                    .insert_chat_message(
+                        &[id; 32],
+                        topic.as_bytes(),
+                        &[3; 32],
+                        123,
+                        "text",
+                        "old message",
+                        None,
+                        None,
+                        &[3; 32],
+                    )
+                    .unwrap();
+            }
+        }
+        // Reproduce the old toolbar path: clearing memory does not delete SQLite.
+        clear_room_history(target, &mut rooms, &mut history, None).unwrap();
+        assert_eq!(
+            crate::store::MessageStore::open(&path)
+                .unwrap()
+                .count_messages_for_topic(target.as_bytes())
+                .unwrap(),
+            1
+        );
+        let report =
+            clear_persisted_room_history(&dir, target, &mut rooms, &mut history, None).unwrap();
+        assert_eq!(report.chat_entries_removed, 1);
+        assert!(rooms.find(&target).is_some());
+        {
+            let reopened = crate::store::MessageStore::open(&path).unwrap();
+            assert_eq!(
+                reopened
+                    .count_messages_for_topic(target.as_bytes())
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                reopened.count_messages_for_topic(other.as_bytes()).unwrap(),
+                1
+            );
+            reopened
+                .insert_chat_message(
+                    &[4; 32],
+                    target.as_bytes(),
+                    &[3; 32],
+                    124,
+                    "text",
+                    "new message",
+                    None,
+                    None,
+                    &[3; 32],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            crate::store::MessageStore::open(&path)
+                .unwrap()
+                .count_messages_for_topic(target.as_bytes())
+                .unwrap(),
+            1
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_persisted_clear_keeps_runtime_history() {
+        let dir = temp_dir("clear_failure");
+        fs::create_dir_all(dir.join("message_store.db")).unwrap();
+        let target = topic(13);
+        let mut rooms = RoomHistoryStore::empty_at(&dir);
+        rooms.upsert(target, "Target", true);
+        rooms.update_preview(&target, "keep me");
+        let mut history = ChatHistoryStore::empty_at(&dir);
+        history.push(history_entry(target, "keep me"));
+        assert!(
+            clear_persisted_room_history(&dir, target, &mut rooms, &mut history, None).is_err()
+        );
+        assert_eq!(history.count_for_topic(&target), 1);
+        assert_eq!(rooms.find(&target).unwrap().last_preview, "keep me");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

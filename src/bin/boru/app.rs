@@ -196,7 +196,7 @@ use boru_core::public_room_continuous::{
 use boru_core::public_room_safety::PublicRoomSafety;
 use boru_core::public_room_tracker::PublicRoomTracker;
 use boru_core::room::RoomStore;
-use boru_core::room_cleanup::{clear_room_history, delete_room_history, RoomHistoryClearReport};
+use boru_core::room_cleanup::{delete_room_history, RoomHistoryClearReport};
 use boru_core::room_docs::{self, RoomMetadata};
 use boru_core::room_history::RoomHistoryStore;
 #[cfg(feature = "screen-sharing")]
@@ -8671,9 +8671,12 @@ impl IcedChat {
         report: &RoomHistoryClearReport,
     ) {
         if self.topic == topic {
+            #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
+            self.stop_inline_video();
             self.entries.clear();
             self.event_id_to_index.clear();
             self.message_hash_to_index.clear();
+            self.self_sent_events.clear();
             self.layout_cache.borrow_mut().invalidate_all();
             self.pending_file = None;
             self.pending_image.clear();
@@ -8700,6 +8703,7 @@ impl IcedChat {
         }
 
         self.room_history.update_preview(&topic, "");
+        self.chats_sidebar_revision = self.chats_sidebar_revision.wrapping_add(1);
     }
 
     /// Switch the display to a conversation whose runtime state is already in

@@ -6331,59 +6331,9 @@ impl IcedChat {
                 iced::Task::none()
             }
             AppMessage::ClearConversation => {
-                let topic = self.topic;
-                #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
-                self.stop_inline_video();
-                // Clear screen entries and indexes
-                self.entries.clear();
-                self.event_id_to_index.clear();
-                self.message_hash_to_index.clear();
-                self.layout_cache.borrow_mut().clear();
-                self.history_saved_count = 0;
-
-                let event_ids: Vec<u64> = self
-                    .chat_history
-                    .lock()
-                    .unwrap()
-                    .for_topic(&topic)
-                    .into_iter()
-                    .map(|entry| entry.event_id)
-                    .collect();
-
-                // Clear from in-memory chat history store
-                {
-                    let mut chat_history = self.chat_history.lock().unwrap();
-                    let _ =
-                        clear_room_history(topic, &mut self.room_history, &mut chat_history, None);
-                }
-
-                // Remove attachment and DM-history rows from the durable
-                // storage database before dropping the in-memory history.
-                if let Some(storage) = &self.storage {
-                    if let Err(error) = storage.delete_chat_history(topic.as_bytes(), &event_ids) {
-                        warn!(%error, "failed to delete durable chat history for cleared conversation");
-                    }
-                    if let Err(error) = storage.delete_outgoing_for_topic(&topic) {
-                        warn!(%error, "failed to delete outgoing messages for cleared conversation");
-                    }
-                }
-
-                // The message store is the authoritative persistent history
-                // source used when a conversation is restored after restart.
-                // Clearing only the legacy in-memory history and delivery
-                // table leaves these rows available for the startup replay.
-                let message_store_path = self.data_dir.join("message_store.db");
-                match MessageStore::open(&message_store_path)
-                    .and_then(|store| store.hard_delete_conversation(topic.as_bytes()))
-                {
-                    Ok(_) => {}
-                    Err(error) => {
-                        warn!(%error, "failed to permanently delete cleared conversation history");
-                    }
-                }
-
-                self.push_system("Conversation cleared.");
-                iced::Task::none()
+                // Keep legacy callers on the exact same persistence and
+                // runtime-cleanup path as the visible toolbar confirmation.
+                self.update_chat(AppMessage::ConfirmClearHistory)
             }
             AppMessage::ToggleDetailsPanel => {
                 self.details_panel_open = !self.details_panel_open;
@@ -8827,29 +8777,21 @@ impl IcedChat {
                 self.history_clear_feedback = None;
                 self.history_clear_feedback_is_error = false;
                 let topic = self.topic;
-                let room_history = self.room_history.clone();
-                let chat_history = self.chat_history.clone();
-                if let Some(storage) = &self.storage {
-                    let _ = storage.delete_outgoing_for_topic(&topic);
+                // Finish durable deletion and runtime cleanup in the same
+                // update, before a room switch can save the old entries again.
+                let result = match self.chat_history.lock() {
+                    Ok(mut history) => boru_core::room_cleanup::clear_persisted_room_history(
+                        &self.data_dir, topic, &mut self.room_history, &mut history,
+                        self.storage.as_ref(),
+                    ).map_err(|error| error.to_string()),
+                    Err(error) => Err(format!("Could not lock chat history: {error}")),
+                };
+                match result {
+                    Ok(report) => self.update_chat(AppMessage::ClearHistoryFinished {
+                        topic, room_history: self.room_history.clone(), report,
+                    }),
+                    Err(error) => self.update_chat(AppMessage::ClearHistoryFailed { topic, error }),
                 }
-                iced::Task::perform(
-                    async move {
-                        let mut room_history = room_history;
-                        let mut chat_history = chat_history.lock().unwrap();
-                        let report =
-                            clear_room_history(topic, &mut room_history, &mut chat_history, None)
-                                .map_err(|err| err.to_string())?;
-                        Ok::<_, String>((topic, room_history, report))
-                    },
-                    move |result| match result {
-                        Ok((topic, room_history, report)) => AppMessage::ClearHistoryFinished {
-                            topic,
-                            room_history,
-                            report,
-                        },
-                        Err(error) => AppMessage::ClearHistoryFailed { topic, error },
-                    },
-                )
             }
 
             AppMessage::ClearHistoryFinished {
