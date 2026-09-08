@@ -8063,7 +8063,11 @@ impl IcedChat {
                         }
                     }
                     let key = VideoInstanceKey::new(self.topic, message_id, attachment_id);
-                    if self.playback_coordinator.active_video() == Some(&key) {
+                    // A completed local file must replace the HTTP streaming
+                    // decoder, which may already be at EOS or have lost its server.
+                    if self.playback_coordinator.active_video() == Some(&key)
+                        && self.inline_video.as_ref().is_some_and(|s| s.streaming_server.is_none())
+                    {
                         if let Some(session) = self.inline_video.as_mut().filter(|s| s.key == key) {
                             if let Some(video) = session.video.as_mut().and_then(Arc::get_mut) {
                                 video.set_paused(!video.paused());
@@ -8503,6 +8507,17 @@ impl IcedChat {
                     },
                     |_| AppMessage::Noop,
                 )
+            }
+            #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
+            AppMessage::InlineVideoRuntimeError(error) => {
+                tracing::error!(%error, "inline video decoder failed");
+                if let Some(session) = self.inline_video.as_ref() {
+                    return iced::Task::done(AppMessage::InlineVideoEvent(
+                        InlineVideoEvent::Failed { key: session.key.clone(), error },
+                    ));
+                }
+                self.push_system(format!("Video playback failed: {error}"));
+                iced::Task::none()
             }
             #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
             AppMessage::CloseInlineVideo => {

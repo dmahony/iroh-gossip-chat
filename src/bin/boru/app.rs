@@ -4280,6 +4280,8 @@ pub enum AppMessage {
     #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
     /// Close the active inline player and restore its poster.
     CloseInlineVideo,
+    #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
+    InlineVideoRuntimeError(String),
     /// A video stream URL is ready for external playback (no video-playback feature).
     StreamUrl(String),
     #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
@@ -7978,6 +7980,8 @@ impl IcedChat {
             AppMessage::InlineVideoToggleExpanded => "InlineVideoToggleExpanded",
             #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
             AppMessage::CloseInlineVideo => "CloseInlineVideo",
+            #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
+            AppMessage::InlineVideoRuntimeError(_) => "InlineVideoRuntimeError",
             AppMessage::StreamUrl(_) => "StreamUrl",
             #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
             AppMessage::InlineVideoEvent(_) => "InlineVideoEvent",
@@ -11459,6 +11463,7 @@ impl IcedChat {
             AppMessage::StreamingServerReady { .. }
             | AppMessage::StreamingServerFailed { .. }
             | AppMessage::CloseInlineVideo
+            | AppMessage::InlineVideoRuntimeError(_)
             | AppMessage::InlineVideoTick
             | AppMessage::InlineVideoControlsFocused(_)
             | AppMessage::InlineVideoSeekChanged(_)

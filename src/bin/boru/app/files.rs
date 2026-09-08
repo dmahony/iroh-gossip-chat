@@ -6142,6 +6142,7 @@ impl IcedChat {
                                     std::path::PathBuf::from(&abs_path),
                                     metadata.len(),
                                 );
+                                download.direct_offer_key = Some((self.local_public, offer_id));
                             }
                             entry.body = filename.clone();
                         }

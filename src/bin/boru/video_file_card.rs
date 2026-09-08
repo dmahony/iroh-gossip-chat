@@ -1380,7 +1380,7 @@ impl<'a> BoruVideoFileCard<'a> {
                     VideoPlayer::new(&video)
                         .content_fit(iced::ContentFit::Contain)
                         .on_end_of_stream(AppMessage::CloseInlineVideo)
-                        .on_error(|_error| AppMessage::CloseInlineVideo),
+                        .on_error(|error| AppMessage::InlineVideoRuntimeError(error.to_string())),
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
