@@ -7617,6 +7617,42 @@ impl IcedChat {
                     }
                 })
             }
+            AppMessage::SaveVideoCopy(source) => {
+                iced::Task::perform(async move {
+                    let name = source.file_name().unwrap_or_default().to_string_lossy();
+                    let Some(destination) = rfd::AsyncFileDialog::new()
+                        .set_file_name(name.as_ref())
+                        .save_file().await else {
+                        return Ok(());
+                    };
+                    if destination.path() == source {
+                        return Ok(());
+                    }
+                    // A symlinked destination may refer to the source too;
+                    // never truncate the video currently backing the player.
+                    let canonical_source = tokio::fs::canonicalize(&source).await?;
+                    if let Ok(canonical_destination) = tokio::fs::canonicalize(destination.path()).await {
+                        if canonical_destination == canonical_source {
+                            return Ok(());
+                        }
+                    }
+                    tokio::fs::copy(&source, destination.path()).await.map(|_| ())
+                }, |result| match result {
+                    Ok(()) => AppMessage::Noop,
+                    Err(error) => AppMessage::ErrorMsg(format!("Could not save video: {error}")),
+                })
+            }
+            AppMessage::OpenVideoFolder(path) => {
+                iced::Task::perform(async move {
+                    if !path.is_file() {
+                        return Err("The local video is no longer available".to_string());
+                    }
+                    reveal_in_folder(&path).map_err(|error| error.to_string())
+                }, |result| match result {
+                    Ok(()) => AppMessage::Noop,
+                    Err(error) => AppMessage::ErrorMsg(format!("Could not open video folder: {error}")),
+                })
+            }
             AppMessage::DashboardSearchChanged(query) => {
                 self.files_state.dashboard_search_input = query;
                 // Close any half-open "Files I'm Sharing" interactions when

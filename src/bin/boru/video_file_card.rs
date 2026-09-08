@@ -754,6 +754,49 @@ impl<'a> BoruVideoFileCard<'a> {
         let muted = text_system(&theme);
         let error_color = color_error(&theme);
 
+        // Present videos without the attachment card's header and border.
+        if attachment.kind == crate::app::TransferKind::Video {
+            let local_path = match state {
+                DownloadState::Completed { saved_path: Some(path), .. }
+                | DownloadState::Shared { path, .. } if path.is_file() => Some(path.clone()),
+                _ => None,
+            };
+            let sizing = MediaFrameSizing::new(
+                attachment.poster_dimensions, self.band(), self.inner_available_width(),
+            );
+            let download = local_path.as_ref().map_or(
+                AppMessage::ExecuteDownloadAt(self.entry_index),
+                |path| AppMessage::SaveVideoCopy(path.clone()),
+            );
+            let mut controls = Row::new().spacing(SPACE_6);
+            if local_path.is_some() || !matches!(state,
+                DownloadState::Active { .. } | DownloadState::Paused { .. }
+                | DownloadState::Completed { saved_path: None, .. }) {
+                controls = controls.push(secondary_button(None, "Download", download));
+            }
+            if let Some(path) = local_path.as_ref() {
+                controls = controls.push(secondary_button(
+                    None, "Open in folder", AppMessage::OpenVideoFolder(path.clone()),
+                ));
+            }
+            let controls = container(controls).padding(SPACE_6)
+                .width(Length::Fill).align_x(Alignment::End);
+            let media = iced::widget::Stack::new()
+                .push(self.media_frame(attachment, error_color))
+                .push(controls);
+            let mut body = Column::new().width(Length::Fixed(sizing.width))
+                .spacing(SPACE_6).push(media);
+            if local_path.is_none() || attachment.playback_error.is_some() {
+                body = body.push(self.status_metadata(
+                    attachment, &theme, tone, muted, self.placement.metadata_alignment,
+                )).push(self.actions(attachment));
+                if let DownloadState::Failed { failure } = state {
+                    body = body.push(failure_block(failure, &theme, tone, muted, error_color));
+                }
+            }
+            return body.into();
+        }
+
         let header = self.header(attachment, &theme);
         let media = self.media_frame(attachment, error_color);
         let status = self.status_metadata(

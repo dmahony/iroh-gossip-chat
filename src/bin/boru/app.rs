@@ -4287,6 +4287,8 @@ pub enum AppMessage {
     #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
     InlineVideoEvent(InlineVideoEvent),
     OpenDownloadsFolder,
+    SaveVideoCopy(std::path::PathBuf),
+    OpenVideoFolder(std::path::PathBuf),
     ErrorMsg(String),
     ExecuteFileSend(String),
     /// Open the native folder picker and send the selected directory as a
@@ -7986,6 +7988,8 @@ impl IcedChat {
             #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
             AppMessage::InlineVideoEvent(_) => "InlineVideoEvent",
             AppMessage::OpenDownloadsFolder => "OpenDownloadsFolder",
+            AppMessage::SaveVideoCopy(_) => "SaveVideoCopy",
+            AppMessage::OpenVideoFolder(_) => "OpenVideoFolder",
             AppMessage::ReportBug => "ReportBug",
             AppMessage::SaveSupportBundle => "SaveSupportBundle",
             AppMessage::OpenUrl(_) => "OpenUrl",
@@ -13479,6 +13483,8 @@ impl IcedChat {
             // ── File sharing dashboard (state layer) ────────────────
             AppMessage::OpenDownloadsFolder
             | AppMessage::DashboardSearchChanged(_)
+            | AppMessage::SaveVideoCopy(_)
+            | AppMessage::OpenVideoFolder(_)
             | AppMessage::DashboardSearchCleared
             | AppMessage::DashboardSharedByMeSortClicked(_)
             | AppMessage::DashboardDownloadedSortClicked(_)
