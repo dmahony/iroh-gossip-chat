@@ -9508,6 +9508,29 @@ impl IcedChat {
     }
 
     pub fn update(&mut self, message: AppMessage) -> iced::Task<AppMessage> {
+        #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
+        let was_fullscreen = self.inline_video_expanded;
+        let task = self.update_inner(message);
+        #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
+        if was_fullscreen != self.inline_video_expanded {
+            let mode = if self.inline_video_expanded {
+                iced::window::Mode::Fullscreen
+            } else {
+                self.follow_latest = true;
+                self.scroll_offset = f32::MAX;
+                self.scroll_to_bottom_pending = true;
+                self.lightbox_close_snap_guard = 3;
+                iced::window::Mode::Windowed
+            };
+            // Cover decoder errors and cleanup as well as explicit exits.
+            return iced::Task::batch([task, iced::window::latest().then(move |id| {
+                id.map_or_else(iced::Task::none, |id| iced::window::set_mode(id, mode))
+            })]);
+        }
+        task
+    }
+
+    fn update_inner(&mut self, message: AppMessage) -> iced::Task<AppMessage> {
         let gui_action_timeout_id = match &message {
             AppMessage::GuiTestActionReceived(action) => Some(action.action_id.clone()),
             _ => None,

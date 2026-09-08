@@ -1361,7 +1361,7 @@ impl<'a> BoruVideoFileCard<'a> {
                         })
                         .push(media_icon_button(
                             Icon::More,
-                            "More video actions",
+                            "Fullscreen",
                             AppMessage::InlineVideoToggleExpanded,
                         ))
                         .spacing(if compact { SPACE_2 } else { SPACE_6 })

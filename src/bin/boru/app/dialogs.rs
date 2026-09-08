@@ -105,78 +105,26 @@ impl IcedChat {
             ]
             .into();
         };
-        let Some((entry_index, entry)) = self.entries.iter().enumerate().find(|(_, entry)| {
-            entry.event_id == session.key.message_id
-                && entry
-                    .download
-                    .as_ref()
-                    .is_some_and(|download| download.name == session.key.attachment_id)
-        }) else {
-            return base.into();
-        };
-        let Some(attachment) = entry.download.as_ref() else {
-            return base.into();
-        };
-        let player = crate::download_progress_view::view_download_progress_with_player(
-            entry_index,
-            attachment,
-            self.dark_mode,
-            false,
-            Some(video.as_ref()),
-            false,
-            self.inline_video_seek,
-            true,
-            true,
-            entry.timestamp,
-            // The expanded overlay fills the whole window, so the card sizes
-            // against the tracked window width (Task 15 responsive band).
-            self.window_width,
-            // BORU-LAYOUT-05: the expanded-video dialog is an app overlay, not
-            // a chat surface — it keeps the default video-card placement.
-            crate::layout::ComponentPlacement::video_card_default(),
-        );
-        let panel = container(
-            column![
-                iced::widget::row![
-                    crate::fonts::type_role_text(crate::fonts::TypeRole::CardTitle, "Expanded video"),
-                    iced::widget::Space::new().width(Length::Fill),
-                    button(crate::fonts::type_role_text(
-                        crate::fonts::TypeRole::ButtonLabel,
-                        "Close expanded video",
-                    ))
-                    .on_press(AppMessage::InlineVideoToggleExpanded)
-                    .padding([SPACE_6, SPACE_10]),
-                ]
-                .align_y(iced::Alignment::Center),
-                player,
-            ]
-            .spacing(SPACE_8),
-        )
-        .width(Length::FillPortion(9))
-        .height(Length::FillPortion(9))
-        .padding(SPACE_12)
-        .style(|t| iced::widget::container::Style {
-            background: Some(iced::Background::Color(bg_surface(t))),
-            border: iced::Border {
-                color: border_muted(t),
-                width: 1.0,
-                radius: SPACE_10.into(),
-            },
-            ..Default::default()
-        });
+
+        let player = iced_video_player::VideoPlayer::new(video.as_ref())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .content_fit(iced::ContentFit::Contain)
+            .on_end_of_stream(AppMessage::CloseInlineVideo)
+            .on_error(|error| AppMessage::InlineVideoRuntimeError(error.to_string()));
+        let panel = container(player)
+            .width(Length::Fill)
+            .height(Length::Fill);
         let overlay = container(panel)
             .width(Length::Fill)
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
-            .padding(SPACE_16)
-            .style(|t| iced::widget::container::Style {
-                background: Some(iced::Background::Color(
-                    crate::theme::BoruTheme::for_theme(t).colors.expanded_video_backdrop,
-                )),
+            .style(|_t| iced::widget::container::Style {
+                background: Some(iced::Background::Color(iced::Color::BLACK)),
                 ..Default::default()
             });
-        stack![base, overlay].into()
+        overlay.into()
     }
 
     /// Responsive dialog width: the preferred width, capped so the dialog
