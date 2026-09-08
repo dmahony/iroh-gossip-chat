@@ -6192,6 +6192,17 @@ impl IcedChat {
                             sender.broadcast(encoded).await.map_err(|error| {
                                 format!("Failed to broadcast file offer: {error}")
                             })?;
+                            boru_core::store::MessageStore::open(&history_path)
+                                .and_then(|store| {
+                                    store.mark_direct_offer_sent(
+                                        history_topic.as_bytes(),
+                                        &secret_key.public().as_bytes(),
+                                        offer_id,
+                                    )
+                                })
+                                .map_err(|error| {
+                                    format!("Failed to mark file offer sent: {error}")
+                                })?;
                             let sender = Some(sender);
                             tracing::info!(
                                 event = boru_core::diagnostics::event_names::OFFER_BROADCAST,

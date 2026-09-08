@@ -83,7 +83,7 @@ impl MessageStore {
                 let hash = blake3::hash(signed);
                 tx.execute(
                     "INSERT INTO messages(msg_hash,topic,sender,timestamp_ms,kind,body,signed_bytes,delivery_state)
-                     VALUES(?1,?2,?3,?4,'file',?5,?6,'sent') ON CONFLICT(msg_hash) DO NOTHING",
+                     VALUES(?1,?2,?3,?4,'file',?5,?6,'queued') ON CONFLICT(msg_hash) DO NOTHING",
                     params![hash.as_bytes().as_slice(),topic.as_slice(),owner.as_bytes().as_slice(),sent_at.saturating_mul(1000) as i64,name,signed],
                 ).std_context("insert direct offer announcement")?;
                 tx.execute(
@@ -101,6 +101,29 @@ impl MessageStore {
             }
         }
         tx.commit().std_context("commit direct offer")?;
+        Ok(())
+    }
+
+    /// Mark the announcement published after gossip accepts the broadcast.
+    /// Failed broadcasts leave it queued for durable retry handling.
+    pub fn mark_direct_offer_sent(
+        &self,
+        topic: &[u8; 32],
+        owner: &[u8; 32],
+        offer_id: FileOfferId,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE messages SET delivery_state='sent'
+                 WHERE msg_hash=(SELECT announcement_hash FROM direct_offer_state
+                                 WHERE topic=?1 AND owner=?2 AND offer_id=?3)",
+                params![topic.as_slice(), owner.as_slice(), offer_id.as_bytes().as_slice()],
+            )
+            .std_context("mark direct offer sent")?;
+        if changed == 0 {
+            return Err(n0_error::anyerr!("direct offer announcement not found"));
+        }
         Ok(())
     }
 
@@ -205,6 +228,21 @@ mod tests {
             .unwrap();
         assert_eq!(state.ready.as_deref(), Some(poster.as_ref()));
         assert_eq!(state.local_path.as_deref(), Some("/tmp/video.mp4"));
+        assert_eq!(
+            store
+                .get_messages_for_topic(&topic, 100, 0)
+                .unwrap()[0]
+                .delivery_state,
+            "queued"
+        );
+        store.mark_direct_offer_sent(&topic, &owner, id).unwrap();
+        assert_eq!(
+            store
+                .get_messages_for_topic(&topic, 100, 0)
+                .unwrap()[0]
+                .delivery_state,
+            "sent"
+        );
         assert_eq!(
             store
                 .conn
