@@ -7346,7 +7346,7 @@ impl IcedChat {
         };
         let mut ticket = String::new();
         let mut thumbnail = None;
-        if let Some(bytes) = state.as_ref().and_then(|s| s.ready.as_deref()) {
+        if let Some(bytes) = state.as_ref().and_then(|s| s.ticket.as_deref()) {
             if let Ok((
                 signer,
                 Message::FileOfferReady {
@@ -7359,7 +7359,15 @@ impl IcedChat {
             {
                 if signer == owner && ready_id == offer_id {
                     ticket = ready_ticket;
-                    thumbnail = thumbnail_hash;
+                    thumbnail = state
+                        .as_ref()
+                        .and_then(|s| s.poster.as_deref())
+                        .and_then(|poster| SignedMessage::verify_and_decode(poster).ok())
+                        .and_then(|(_, message, _)| match message {
+                            Message::FileOfferReady { thumbnail_hash, .. } => thumbnail_hash,
+                            _ => None,
+                        })
+                        .or(thumbnail_hash);
                 }
             }
         }

@@ -5,6 +5,11 @@ use crate::chat_core::{Message, SignedMessage};
 
 /// Local projection; signed network payloads remain unchanged.
 pub struct DirectOfferState {
+    /// The freshest signed ticket projection, regardless of poster state.
+    pub ticket: Option<Vec<u8>>,
+    /// The freshest signed ticket that carried a poster.
+    pub poster: Option<Vec<u8>>,
+    /// Legacy/effective projection retained for callers during migration.
     pub ready: Option<Vec<u8>>,
     pub local_path: Option<String>,
 }
@@ -57,12 +62,28 @@ impl MessageStore {
         )
         .std_context("ensure direct offer state")?;
         if ready {
-            // Posterless retries must not erase a poster. Older updates must
-            // not replace newer tickets. Equal-second poster upgrades are valid.
+            // Ticket and poster freshness are independent. A ticket-only
+            // update must advance the ticket without erasing an older poster.
             tx.execute(
-                "UPDATE direct_offer_state SET ready_signed=?4, ready_at=?5, has_thumbnail=?6
+                "UPDATE direct_offer_state SET
+                    ticket_signed=CASE WHEN ticket_at IS NULL OR ticket_at<=?5
+                                       THEN ?4 ELSE ticket_signed END,
+                    ticket_at=CASE WHEN ticket_at IS NULL OR ticket_at<=?5
+                                   THEN ?5 ELSE ticket_at END,
+                    poster_signed=CASE WHEN ?6 AND (poster_at IS NULL OR poster_at<=?5)
+                                       THEN ?4 ELSE poster_signed END,
+                    poster_at=CASE WHEN ?6 AND (poster_at IS NULL OR poster_at<=?5)
+                                   THEN ?5 ELSE poster_at END,
+                    ready_signed=CASE WHEN ?6 AND (poster_at IS NULL OR poster_at<=?5)
+                                      THEN ?4
+                                      WHEN NOT ?6 AND (ticket_at IS NULL OR ticket_at<=?5)
+                                      THEN COALESCE(poster_signed,?4)
+                                      ELSE ready_signed END,
+                    ready_at=CASE WHEN ticket_at IS NULL OR ticket_at<=?5
+                                  THEN ?5 ELSE ready_at END,
+                    has_thumbnail=CASE WHEN ?6 THEN 1 ELSE has_thumbnail END
                  WHERE topic=?1 AND owner=?2 AND offer_id=?3
-                 AND (ready_signed IS NULL OR (ready_at<=?5 AND has_thumbnail<=?6))",
+                ",
                 params![
                     topic.as_slice(),
                     owner.as_bytes().as_slice(),
@@ -134,9 +155,12 @@ impl MessageStore {
         offer_id: FileOfferId,
     ) -> Result<Option<DirectOfferState>> {
         self.conn.lock().unwrap().query_row(
-            "SELECT ready_signed,local_path FROM direct_offer_state WHERE topic=?1 AND owner=?2 AND offer_id=?3",
+            "SELECT ticket_signed,poster_signed,ready_signed,local_path
+             FROM direct_offer_state WHERE topic=?1 AND owner=?2 AND offer_id=?3",
             params![topic.as_slice(),owner.as_slice(),offer_id.as_bytes().as_slice()],
-            |r| Ok(DirectOfferState { ready: r.get(0)?, local_path: r.get(1)? }),
+            |r| Ok(DirectOfferState {
+                ticket: r.get(0)?, poster: r.get(1)?, ready: r.get(2)?, local_path: r.get(3)?,
+            }),
         ).optional().std_context("read direct offer state")
     }
 
@@ -199,6 +223,7 @@ mod tests {
             },
         )
         .unwrap();
+        let newer_ready_bytes;
         {
             let store = MessageStore::open(&path).unwrap();
             store
@@ -210,6 +235,31 @@ mod tests {
             store
                 .persist_direct_offer(&topic, &announcement, &[1; 32], None)
                 .unwrap();
+            store
+                .persist_direct_offer(&topic, &ready, &[1; 32], None)
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let newer_ticket = iroh_blobs::ticket::BlobTicket::new(
+                iroh::EndpointAddr::new(key.public()),
+                iroh_blobs::Hash::new(b"new-video"),
+                iroh_blobs::BlobFormat::Raw,
+            )
+            .to_string();
+            newer_ready_bytes = SignedMessage::sign_and_encode(
+                &key,
+                &Message::FileOfferReady {
+                    offer_id: id,
+                    ticket: newer_ticket,
+                    thumbnail_hash: None,
+                },
+            )
+            .unwrap()
+            .to_vec();
+            store
+                .persist_direct_offer(&topic, &newer_ready_bytes, &[1; 32], None)
+                .unwrap();
+            // The older ticket must not roll back the independent ticket
+            // projection, while its lack of a poster must not clear poster.
             store
                 .persist_direct_offer(&topic, &ready, &[1; 32], None)
                 .unwrap();
@@ -226,6 +276,8 @@ mod tests {
             .direct_offer_state(&topic, &owner, id)
             .unwrap()
             .unwrap();
+        assert_eq!(state.ticket.as_deref(), Some(newer_ready_bytes.as_slice()));
+        assert_eq!(state.poster.as_deref(), Some(poster.as_ref()));
         assert_eq!(state.ready.as_deref(), Some(poster.as_ref()));
         assert_eq!(state.local_path.as_deref(), Some("/tmp/video.mp4"));
         assert_eq!(
