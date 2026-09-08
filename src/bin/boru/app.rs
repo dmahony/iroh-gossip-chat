@@ -5861,7 +5861,10 @@ impl IcedChat {
             } else {
                 ConversationStore::load_or_default(&data_dir)
             };
-            if store.is_empty() {
+            // SQLite is canonical once storage is available. An empty
+            // canonical store is also the expected result after deletion;
+            // falling back to legacy JSON here would resurrect conversations.
+            if storage.is_none() && store.is_empty() {
                 let json_store = ConversationStore::load_or_default(&data_dir);
                 if !json_store.is_empty() {
                     if let Some(ref st) = storage {
@@ -13958,6 +13961,14 @@ impl IcedChat {
                 .delete_chat_history(topic.as_bytes(), &event_ids)
                 .map_err(|err| err.to_string())?;
         }
+        // Keep the canonical message store deletion/tombstone in lockstep
+        // with the conversation metadata deletion. Otherwise a still-present
+        // legacy JSON file could repopulate this topic on a later migration.
+        let message_store = MessageStore::open(self.data_dir.join("message_store.db"))
+            .map_err(|err| err.to_string())?;
+        message_store
+            .delete_messages_for_topic(topic.as_bytes())
+            .map_err(|err| err.to_string())?;
 
         // Clean up outgoing messages in storage before mutating in-memory stores
         if let Some(storage) = &self.storage {

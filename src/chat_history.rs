@@ -1482,6 +1482,10 @@ mod tests {
         // SQLite now has exactly the two imported rows.
         let ms = MessageStore::open(&ms_path).unwrap();
         assert_eq!(ms.get_all_messages().unwrap().len(), 2);
+        assert_eq!(
+            ms.migration_version("chat_history_json_to_messages").unwrap(),
+            Some(1)
+        );
 
         // Re-running the migration on an already-migrated store imports
         // nothing new (INSERT OR IGNORE is idempotent by content hash).
@@ -1490,6 +1494,26 @@ mod tests {
             .migrate_legacy_json(&ms_path, key.public().as_bytes())
             .unwrap();
         assert_eq!(imported_again, 0, "no duplicate rows after re-import");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleted_topic_in_legacy_json_is_not_resurrected() {
+        let dir = temp_dir("legacy-delete-tombstone");
+        let topic = make_topic(0xE8);
+        let key = iroh::SecretKey::generate();
+        let mut legacy = ChatHistoryStore::empty_at(&dir);
+        legacy.push_with_id(legacy_entry(topic, &key, 1));
+        write_legacy_fixture(&dir, &legacy);
+
+        let ms_path = dir.join("message_store.db");
+        let ms = MessageStore::open(&ms_path).unwrap();
+        ms.delete_messages_for_topic(topic.as_bytes()).unwrap();
+        assert_eq!(
+            legacy.migrate_legacy_json(&ms_path, key.public().as_bytes()).unwrap(),
+            0
+        );
+        assert_eq!(ms.count_messages_for_topic(topic.as_bytes()).unwrap(), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 

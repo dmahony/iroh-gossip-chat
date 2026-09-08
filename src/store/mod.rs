@@ -271,6 +271,19 @@ impl MessageStore {
             CREATE INDEX IF NOT EXISTS idx_messages_hash
                 ON messages(msg_hash);
 
+            -- Durable guards for legacy JSON migration.  Unlike the legacy
+            -- file, these records are part of the canonical store and must
+            -- survive deletion and restart.
+            CREATE TABLE IF NOT EXISTS migration_markers (
+                name TEXT PRIMARY KEY,
+                version INTEGER NOT NULL,
+                completed_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS chat_history_tombstones (
+                topic BLOB PRIMARY KEY,
+                deleted_at_ms INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS direct_offer_state (
                 topic BLOB NOT NULL,
                 owner BLOB NOT NULL,

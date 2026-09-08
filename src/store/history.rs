@@ -8,6 +8,18 @@
 use super::*;
 
 impl super::MessageStore {
+    /// Return the completed version of a named durable migration, if present.
+    pub fn migration_version(&self, name: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT version FROM migration_markers WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()
+        .std_context("read migration marker")
+    }
+
     /// Return up to `count` of the most recent signed chat messages for a
     /// topic, oldest first.  This is the history source shared by local
     /// replay and the backfill protocol.
@@ -219,8 +231,32 @@ impl super::MessageStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .std_context("begin legacy chat history import")?;
+        const MIGRATION_NAME: &str = "chat_history_json_to_messages";
+        const MIGRATION_VERSION: i64 = 1;
+        let already_completed: Option<i64> = tx
+            .query_row(
+                "SELECT version FROM migration_markers WHERE name = ?1",
+                [MIGRATION_NAME],
+                |row| row.get(0),
+            )
+            .optional()
+            .std_context("check legacy chat history migration marker")?;
+        if already_completed == Some(MIGRATION_VERSION) {
+            return Ok(0);
+        }
         let mut inserted = 0usize;
         for entry in entries {
+            let deleted: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM chat_history_tombstones WHERE topic = ?1)",
+                    [entry.topic.as_bytes().as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .std_context("check legacy chat history tombstone")?
+                != 0;
+            if deleted {
+                continue;
+            }
             let hash_vec = hex::decode(&entry.hash).unwrap_or_default();
             let hash = if hash_vec.len() == 32 {
                 let mut value = [0u8; 32];
@@ -291,6 +327,14 @@ impl super::MessageStore {
                 .std_context("update conversation meta for legacy chat message")?;
             }
         }
+        tx.execute(
+            "INSERT INTO migration_markers (name, version, completed_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET version = excluded.version,
+                                             completed_at_ms = excluded.completed_at_ms",
+            params![MIGRATION_NAME, MIGRATION_VERSION, unix_now_ms() as i64],
+        )
+        .std_context("record legacy chat history migration marker")?;
         tx.commit()
             .std_context("commit legacy chat history import")?;
         Ok(inserted)
@@ -474,6 +518,12 @@ impl super::MessageStore {
     pub fn delete_messages_for_topic(&self, topic: &[u8; 32]) -> Result<usize> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().std_context("begin topic history deletion")?;
+        tx.execute(
+            "INSERT OR REPLACE INTO chat_history_tombstones (topic, deleted_at_ms)
+             VALUES (?1, ?2)",
+            params![topic.as_slice(), unix_now_ms() as i64],
+        )
+        .std_context("record topic history tombstone")?;
         tx.execute("DELETE FROM direct_offer_state WHERE topic=?1", [topic.as_slice()])
             .std_context("delete direct offer state")?;
         let deleted = tx

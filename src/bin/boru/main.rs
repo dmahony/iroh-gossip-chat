@@ -1121,8 +1121,11 @@ fn main() -> Result<()> {
             );
         }
 
+        // SQLite is the live history source. Do not load legacy JSON into the
+        // runtime projection, even if the backup rename failed after a
+        // durable migration marker was committed.
         let chat_history = Arc::new(std::sync::Mutex::new(
-            ChatHistoryStore::load_or_default(&data_dir),
+            ChatHistoryStore::empty_at(&data_dir),
         ));
         // BORU-DISC-18: keep the in-memory history free of the stale lobby
         // topic too — covers the case where the legacy JSON migration failed
