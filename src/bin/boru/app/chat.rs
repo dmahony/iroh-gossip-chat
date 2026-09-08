@@ -8109,11 +8109,8 @@ impl IcedChat {
                         controls_last_interaction: Instant::now(),
                         controls_focused: false,
                     });
-                    // Chat renders the video thumbnail only — playback always
-                    // happens in the expanded overlay. Open it as soon as a
-                    // fresh session starts so the player never renders inline
-                    // in the chat card (it appears once the decoder loads).
-                    self.inline_video_expanded = true;
+                    // Play stays inside the chat; expansion is an explicit action.
+                    self.inline_video_expanded = false;
                     self.inline_video_resume = None;
                     self.layout_cache.borrow_mut().invalidate_from(entry_index);
                     return iced::Task::perform(
@@ -8708,12 +8705,15 @@ impl IcedChat {
             }
             #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
             AppMessage::InlineVideoToggleExpanded => {
-                // Chat surfaces render the video thumbnail only, so there is
-                // no inline player to degrade to: closing the expanded
-                // overlay stops playback entirely (CloseInlineVideo
-                // semantics) instead of leaving an invisible session.
-                if self.inline_video_expanded {
-                    self.stop_inline_video();
+                if self.inline_video.is_some() {
+                    self.inline_video_expanded = !self.inline_video_expanded;
+                    if !self.inline_video_expanded {
+                        self.follow_latest = true;
+                        self.scroll_offset = f32::MAX;
+                        self.scroll_to_bottom_pending = true;
+                        self.lightbox_close_snap_guard = 3;
+                    }
+                    self.layout_cache.borrow_mut().clear();
                 }
                 iced::Task::none()
             }

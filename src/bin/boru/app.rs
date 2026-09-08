@@ -8393,6 +8393,14 @@ impl IcedChat {
 
     #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
     fn stop_inline_video(&mut self) {
+        if self.inline_video_expanded {
+            // Removing the overlay rebuilds the scrollable. Ignore its initial
+            // top-offset event until the pending bottom snap has landed.
+            self.follow_latest = true;
+            self.scroll_offset = f32::MAX;
+            self.scroll_to_bottom_pending = true;
+            self.lightbox_close_snap_guard = 3;
+        }
         if let Some(session) = self.inline_video.as_mut() {
             if let Some(video) = session.video.as_mut() {
                 if let Some(video) = Arc::get_mut(video) {

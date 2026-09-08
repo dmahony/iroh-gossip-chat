@@ -1748,12 +1748,12 @@ impl IcedChat {
                 && session.key.message_id == self.entries[entry_index].event_id
                 && session.key.attachment_id == attachment.name
         });
-        // Chat surfaces render the video THUMBNAIL only: playback always
-        // happens in the expanded overlay (view_expanded_inline_video), never
-        // inline inside the chat card. The active session still drives
-        // `preparing` (loading feedback) and `controls_visible` below.
+        // Render the decoder in exactly one place: the chat card by default,
+        // or the overlay when the user explicitly expands it.
         #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
-        let player = None;
+        let player = active_player
+            .filter(|_| !self.inline_video_expanded)
+            .and_then(|session| session.video.as_deref());
         #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
         let preparing = active_player.is_some_and(|session| session.video.is_none());
         #[cfg(all(feature = "video-playback", not(target_os = "windows")))]
