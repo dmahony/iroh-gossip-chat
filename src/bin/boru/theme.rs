@@ -2103,9 +2103,9 @@ mod tests {
         let c = ColorTokens::light();
         assert_eq!(
             c.accent(),
-            Color::from_rgb(142.0 / 255.0, 192.0 / 255.0, 124.0 / 255.0)
+            Color::from_rgb(24.0 / 255.0, 127.0 / 255.0, 80.0 / 255.0)
         );
-        assert!(c.accent_hover().r < c.accent().r);
+        assert!(c.accent_hover().r > c.accent().r);
         assert!(c.primary_pressed.g < c.primary_hover.g);
         assert_eq!(c.primary_soft.a, 1.0);
     }

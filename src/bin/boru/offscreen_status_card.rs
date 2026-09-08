@@ -226,7 +226,10 @@ mod tests {
             let content_col_x = content_row_x + content_col.bounds().x;
             let divider = &content_col.children()[0];
             let description = &content_col.children()[2];
-            let footer = &content_col.children()[4];
+            let footer = content_col
+                .children()
+                .last()
+                .expect("status card content column has a footer");
             for (name, el) in [
                 ("divider", divider),
                 ("description", description),

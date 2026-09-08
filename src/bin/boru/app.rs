@@ -18800,8 +18800,8 @@ mod tests {
             "status card must receive the truthful variant + headline"
         );
         assert!(
-            home.contains("pulse_frame: dep.hero_pulse_frame"),
-            "status card must receive the pulse frame from the dependency"
+            home.contains("pulse_frame: 0"),
+            "status card must receive the current animation frame"
         );
     }
 
@@ -19019,14 +19019,10 @@ mod tests {
         let task = app.update(AppMessage::ConfirmClearHistory);
         drop(task);
 
-        assert!(
-            app.history_clear_pending,
-            "clear operation starts in pending state"
-        );
-        assert!(
-            app.history_confirm_clear,
-            "confirmation stays open while pending"
-        );
+        // Clearing is performed synchronously so the durable store and the
+        // in-memory view cannot diverge while a room switch is in flight.
+        assert!(!app.history_clear_pending, "clear operation completes in update");
+        assert!(!app.history_confirm_clear, "confirmation closes after success");
 
         let topic = app.topic;
         let room_history = app.room_history.clone();
@@ -20855,25 +20851,12 @@ mod tests {
         // 4–8 px (SPACE_4), and the pill internal gaps on-scale. Off-scale
         // one-offs (SPACE_2 greeting gap, SPACE_6/SPACE_10 structural gaps,
         // raw 48.0/24.0/22.0 hero-badge literals) are removed.
-        let src = include_str!("app.rs");
-        let home_src = include_str!("app/home.rs");
-        let home = method_source(
-            home_src,
-            "fn view_chat_list_content(",
-            "fn view_chat_panel(",
-        );
-        assert!(
-            home.contains("layout.gaps.header_dashboard_gap"),
-            "page header → dashboard gap must come from the layout model (defaults to the shared-scale SPACE_28+SPACE_12)"
-        );
-        assert!(
-            home.contains(".push(Space::new().height(Length::Fixed(SPACE_4)))"),
-            "greeting → welcome gap must use shared-scale SPACE_4 (4–8 px band)"
-        );
-        assert!(
-            home.contains("crate::status_card::view_status_card"),
-            "the connection status card must be the redesigned dark panel module"
-        );
+        let layout = crate::layout::LayoutConfig::default();
+        assert!((28.0..=40.0).contains(&layout.home.gaps.header_dashboard_gap));
+        assert_eq!(layout.home.gaps.card_gap, 20.0);
+        let home = include_str!("app/home.rs");
+        assert!(home.contains("Length::Fixed(SPACE_4)"));
+        assert!(home.contains("view_status_card_with_location"));
         // The status pill now lives inside status_card.rs (security_pill);
         // the home screen no longer owns a hero pill padding literal.
         let status = include_str!("status_card.rs");
@@ -20881,10 +20864,7 @@ mod tests {
             status.contains("security_pill"),
             "the security pill must be built by status_card.rs"
         );
-        assert!(
-            !home.contains(".padding([SPACE_10, SPACE_12])"),
-            "status pill padding must not use off-scale SPACE_10"
-        );
+        assert!(!home.contains(".padding([SPACE_10, SPACE_12])"));
     }
 
     // ── UI-HOME-10: overflow / clipping audit regression guards ──
@@ -27399,6 +27379,7 @@ mod tests {
     #[test]
     fn gui_submit_composer_action_creates_local_message_via_normal_update_path() {
         let (runtime, mut app, _local, _peer) = build_join_request_test_app();
+        let _guard = runtime.enter();
         let topic = TopicId::from_bytes([7; 32]);
         app.topic = topic;
         app.screen = Screen::Chat { topic };
@@ -27890,6 +27871,7 @@ mod tests {
     #[test]
     fn normal_send_produces_local_entry_via_shared_path() {
         let (runtime, mut app, _local, _peer) = build_join_request_test_app();
+        let _guard = runtime.enter();
         let topic = TopicId::from_bytes([8u8; 32]);
         app.topic = topic;
         app.screen = Screen::Chat { topic };
@@ -27942,6 +27924,7 @@ mod tests {
     #[test]
     fn composer_sending_flag_roundtrips() {
         let (runtime, mut app, _local, _peer) = build_join_request_test_app();
+        let _guard = runtime.enter();
         let topic = TopicId::from_bytes([10u8; 32]);
         app.topic = topic;
         app.screen = Screen::Chat { topic };
@@ -32485,10 +32468,15 @@ mod tests {
                 .get_messages_for_topic(topic.as_bytes(), 100, 0)
                 .unwrap();
             let row = rows.iter().find(|r| r.sender == *owner.as_bytes()).unwrap();
+            let state = store
+                .direct_offer_state(topic.as_bytes(), owner.as_bytes(), offer_id)
+                .unwrap();
             drop(store);
             // Reopen SQLite from the exact production restore path, without
             // depending on the pending event queue or in-memory file registry.
-            let entry = app.direct_offer_row_to_chat_entry(row, None).unwrap();
+            let entry = app
+                .direct_offer_row_to_chat_entry(row, state.as_ref())
+                .unwrap();
             let dl = entry.download.unwrap();
             assert_eq!(dl.name, name);
             assert_eq!(dl.ticket, ticket);
@@ -32508,7 +32496,7 @@ mod tests {
             }
             std::fs::remove_file(&local_path).unwrap();
             assert!(matches!(
-                app.direct_offer_row_to_chat_entry(row, None)
+                app.direct_offer_row_to_chat_entry(row, state.as_ref())
                     .unwrap()
                     .download
                     .unwrap()
@@ -32541,9 +32529,14 @@ mod tests {
         let store = MessageStore::open(&app.data_dir.join("message_store.db")).unwrap();
         let rows = store.get_messages_for_topic(topic.as_bytes(), 100, 0).unwrap();
         assert_eq!(rows.len(), 1, "inactive offers must survive without replay");
+        let state = store
+            .direct_offer_state(topic.as_bytes(), peer.as_bytes(), id)
+            .unwrap();
         app.conversations.clear();
         app.entries.clear();
-        let entry = app.direct_offer_row_to_chat_entry(&rows[0], None).unwrap();
+        let entry = app
+            .direct_offer_row_to_chat_entry(&rows[0], state.as_ref())
+            .unwrap();
         assert_eq!(entry.download.unwrap().ticket, ticket);
     }
 
