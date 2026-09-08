@@ -90,6 +90,7 @@ use boru_core::chat_core::friend_ping::{
     FRIEND_PING_ALPN,
 };
 use boru_core::chat_history::ChatHistoryStore;
+use boru_core::store::MessageStore;
 use boru_core::file_access_handler::{FileAccessHandler, NonceStore};
 use boru_core::file_offer::FileOfferRegistry;
 use boru_core::file_offer_protocol::{FileOfferProtocolHandler, FILE_OFFER_ALPN};
@@ -1083,6 +1084,7 @@ fn main() -> Result<()> {
 
         // ── Persistent history stores ────────────────────────────────
         let room_history = RoomHistoryStore::empty_at(&data_dir);
+        let message_store = MessageStore::open(data_dir.join("message_store.db"))?;
 
         // One-time legacy migration: import chat_history.json into the
         // SQLite `messages` table (message_store.db), then rename the JSON
@@ -1138,7 +1140,11 @@ fn main() -> Result<()> {
         // ── Backfill handler ──────────────────────────────────────────
         // Authorization is anchored to this node's own public key; remote
         // requests must name a concrete topic and pass `authorize_backfill`.
-        let backfill_handler = BackfillProtocolHandler::new(storage.clone(), secret_key.public());
+        let backfill_handler = BackfillProtocolHandler::new(
+            message_store.clone(),
+            storage.clone(),
+            secret_key.public(),
+        );
 
         // ── Whisper protocol ──────────────────────────────────────────
         // Direct QUIC channels for private 1:1 messaging and file transfer.

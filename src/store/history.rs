@@ -8,6 +8,53 @@
 use super::*;
 
 impl super::MessageStore {
+    /// Return up to `count` of the most recent signed chat messages for a
+    /// topic, oldest first.  This is the history source shared by local
+    /// replay and the backfill protocol.
+    pub fn get_recent_signed_messages_for_topic(
+        &self,
+        topic: &[u8; 32],
+        count: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT timestamp_ms, signed_bytes FROM messages
+                 WHERE topic = ?1 AND signed_bytes IS NOT NULL
+                 ORDER BY timestamp_ms DESC, id DESC LIMIT ?2",
+            )
+            .std_context("prepare recent signed messages for topic")?;
+        let mut rows = stmt
+            .query(params![topic.as_slice(), count as i64])
+            .std_context("query recent signed messages for topic")?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().std_context("read recent signed message")? {
+            result.push((
+                row.get::<_, i64>(0).std_context("read message timestamp")? as u64,
+                row.get::<_, Vec<u8>>(1).std_context("read signed message bytes")?,
+            ));
+        }
+        result.reverse();
+        Ok(result)
+    }
+
+    /// Count signed chat messages for a topic, excluding metadata-only rows.
+    pub fn count_signed_messages_for_topic(&self, topic: &[u8; 32]) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages
+                 WHERE topic = ?1 AND signed_bytes IS NOT NULL",
+                [topic.as_slice()],
+                |row| row.get(0),
+            )
+            .std_context("count signed messages for topic")?;
+        Ok(count as usize)
+    }
+
     /// Store an optional reply target for a message. The operation is
     /// idempotent, which is important for duplicate and reordered backfill.
     pub fn insert_reply_reference(
