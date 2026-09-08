@@ -425,10 +425,14 @@ impl super::MessageStore {
 
     /// Remove all messages for a topic (used when a room is deleted).
     pub fn delete_messages_for_topic(&self, topic: &[u8; 32]) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        let deleted = conn
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().std_context("begin topic history deletion")?;
+        tx.execute("DELETE FROM direct_offer_state WHERE topic=?1", [topic.as_slice()])
+            .std_context("delete direct offer state")?;
+        let deleted = tx
             .execute("DELETE FROM messages WHERE topic = ?1", [topic.as_slice()])
             .std_context("delete messages for topic")?;
+        tx.commit().std_context("commit topic history deletion")?;
         Ok(deleted)
     }
 

@@ -150,7 +150,6 @@ use boru_core::chat_core::{
     handle_net_event_with_safety_for_topic, merge_bootstrap_peer_addrs, message_hash,
     seed_memory_lookup, MeshHealth, MessageHash, RoomInviteV2,
 };
-use boru_core::pinned_messages::{PinAction, PinState};
 use boru_core::chat_history::{ChatHistoryStore, DeliveryState, HistoryEntry};
 use boru_core::contact::{direct_topic, ContactAction, SignedContactMessage};
 use boru_core::control_plane::advertisement::{
@@ -187,6 +186,7 @@ use boru_core::mailbox::{
     seal_for, IncomingAcceptance, MailboxAck, MailboxIdentity, MailboxPublicKey, MailboxStore,
 };
 use boru_core::net::Gossip;
+use boru_core::pinned_messages::{PinAction, PinState};
 use boru_core::private_room_tracker::{PrivateContinuousTracker, PrivateRoomTracker};
 use boru_core::proto::TopicId;
 use boru_core::public_room::{public_discovery_key, PublicNetwork, PublicRoomIdentity};
@@ -7288,6 +7288,108 @@ impl IcedChat {
     }
 
     /// Convert a SQLite `ChatMessageRow` to a `ChatEntry` for in-memory replay.
+    fn direct_offer_row_to_chat_entry(
+        &self,
+        row: &boru_core::store::ChatMessageRow,
+    ) -> Option<ChatEntry> {
+        let (owner, message, _) =
+            SignedMessage::verify_and_decode(row.signed_bytes.as_deref()?).ok()?;
+        let Message::FileOffer {
+            offer_id,
+            name,
+            size,
+        } = message
+        else {
+            return None;
+        };
+        if owner.as_bytes() != &row.sender {
+            return None;
+        }
+        let store = match MessageStore::open(&self.data_dir.join("message_store.db")) {
+            Ok(store) => store,
+            Err(error) => {
+                warn!(%error, "cannot restore direct offer");
+                return None;
+            }
+        };
+        let state = match store.direct_offer_state(&row.topic, &row.sender, offer_id) {
+            Ok(state) => state,
+            Err(error) => {
+                warn!(%error, "cannot restore direct offer metadata");
+                return None;
+            }
+        };
+        let mut ticket = String::new();
+        let mut thumbnail = None;
+        if let Some(bytes) = state.as_ref().and_then(|s| s.ready.as_deref()) {
+            if let Ok((
+                signer,
+                Message::FileOfferReady {
+                    offer_id: ready_id,
+                    ticket: ready_ticket,
+                    thumbnail_hash,
+                },
+                _,
+            )) = SignedMessage::verify_and_decode(bytes)
+            {
+                if signer == owner && ready_id == offer_id {
+                    ticket = ready_ticket;
+                    thumbnail = thumbnail_hash;
+                }
+            }
+        }
+        let kind = if ChatEntry::is_video_file(&name) {
+            TransferKind::Video
+        } else {
+            TransferKind::File
+        };
+        let mut entry = ChatEntry::system_download(
+            name.clone(),
+            kind,
+            name.clone(),
+            ticket.clone(),
+            self.resolve_name(&owner),
+            None,
+        );
+        let download = entry.download.as_mut()?;
+        download.direct_offer_key = Some((owner, offer_id));
+        download.expected_content_hash = content_hash_from_ticket(&ticket);
+        download.thumbnail_hash = thumbnail;
+        download.availability = if ticket.is_empty() {
+            AttachmentAvailability::DirectOffer { owner, offer_id }
+        } else {
+            AttachmentAvailability::Hybrid {
+                owner,
+                offer_id,
+                ticket,
+            }
+        };
+        download.state = DownloadState::Ready { total: Some(size) };
+        if let Some(path) = state
+            .and_then(|s| s.local_path)
+            .map(std::path::PathBuf::from)
+        {
+            if path.is_file() && path.metadata().is_ok_and(|m| m.len() == size) {
+                download.state = if owner == self.local_public {
+                    files::direct_offer_sender_state(name, path, size)
+                } else {
+                    DownloadState::Completed {
+                        saved_name: name,
+                        saved_path: Some(path),
+                        total_size: Some(size),
+                    }
+                };
+            }
+        }
+        entry.message_hash = Some(row.msg_hash);
+        entry.timestamp = Some(row.timestamp_ms);
+        entry.event_id = row.id as u64;
+        entry.sender_key = Some(owner);
+        info!(offer_id=?offer_id, ticket_ready=!download.ticket.is_empty(), "restored direct-offer chat card");
+        Some(entry)
+    }
+
+    /// Convert a SQLite `ChatMessageRow` to a `ChatEntry` for in-memory replay.
     #[expect(dead_code)]
     fn chat_message_row_to_chat_entry(
         row: &boru_core::store::ChatMessageRow,
@@ -8161,7 +8263,9 @@ impl IcedChat {
             AppMessage::OpenFriendChat(_) => "OpenFriendChat",
             AppMessage::ToggleSound(_) => "ToggleSound",
             AppMessage::SetNotificationPolicy(_) => "SetNotificationPolicy",
-            AppMessage::SetConversationNotificationPolicy(_, _) => "SetConversationNotificationPolicy",
+            AppMessage::SetConversationNotificationPolicy(_, _) => {
+                "SetConversationNotificationPolicy"
+            }
             AppMessage::TogglePresenceIndicator(_) => "TogglePresenceIndicator",
             AppMessage::ToggleTypingIndicators(_) => "ToggleTypingIndicators",
             AppMessage::ToggleInviteAddressSharing(_) => "ToggleInviteAddressSharing",
@@ -10486,9 +10590,20 @@ impl IcedChat {
                         })
                         .unwrap_or_default();
                     for row in &sqlite_rows {
-                        if let Some(chat_entry) =
-                            Self::chat_message_row_to_chat_entry(row, &local_hex)
+                        if let Some(chat_entry) = self
+                            .direct_offer_row_to_chat_entry(row)
+                            .or_else(|| Self::chat_message_row_to_chat_entry(row, &local_hex))
                         {
+                            if let Some(download) = chat_entry.download.as_ref() {
+                                self.download_entry_index = Some(self.entries.len());
+                                if let Some(hash) = download.thumbnail_hash {
+                                    self.pending_thumbnail_fetch.push_back((
+                                        self.entries.len(),
+                                        hash,
+                                        download.ticket.clone(),
+                                    ));
+                                }
+                            }
                             self.entries_push(chat_entry);
                         }
                     }
@@ -13236,9 +13351,11 @@ impl IcedChat {
                     .map(|mut queue| queue.drain(..).collect())
                     .unwrap_or_default();
                 for (offer_id, ticket) in ready_offers {
-                    if self.entries.iter().any(|entry| entry.download.as_ref().is_some_and(|d| {
-                        d.direct_offer_key == Some((self.local_public, offer_id))
-                    })) {
+                    if self.entries.iter().any(|entry| {
+                        entry.download.as_ref().is_some_and(|d| {
+                            d.direct_offer_key == Some((self.local_public, offer_id))
+                        })
+                    }) {
                         self.set_pending_direct_offer_ready(
                             offer_id, ticket, None, self.local_public, None,
                         );
@@ -13951,6 +14068,7 @@ impl IcedChat {
                 message,
                 crate::Message::Message { .. }
                     | crate::Message::FileShare { .. }
+                    | crate::Message::FileOffer { .. }
                     | crate::Message::ImageShare { .. }
                     | crate::Message::SharedGif { .. }
             ),
@@ -14114,6 +14232,7 @@ impl IcedChat {
                 Message::Message { .. }
                     | Message::Reply { .. }
                     | Message::FileShare { .. }
+                    | Message::FileOffer { .. }
                     | Message::ImageShare { .. }
                     | Message::SharedGif { .. }
                     | Message::MessageWithMentions { .. }
@@ -15015,6 +15134,24 @@ impl ChatCallbacks for IcedChat {
         }
         let store_path = self.data_dir.join("message_store.db");
         let result = MessageStore::open(&store_path).and_then(|store| {
+            if let Some(bytes) = signed_bytes.as_deref() {
+                if matches!(
+                    SignedMessage::verify_and_decode(bytes),
+                    Ok((
+                        _,
+                        Message::FileOffer { .. } | Message::FileOfferReady { .. },
+                        _
+                    ))
+                ) {
+                    store.persist_direct_offer(
+                        topic.as_bytes(),
+                        bytes,
+                        &self.local_public.as_bytes(),
+                        None,
+                    )?;
+                    return Ok(true);
+                }
+            }
             store.insert_chat_message(
                 &hash,
                 topic.as_bytes(),
@@ -32120,6 +32257,202 @@ mod tests {
             1,
             "event is queued for replay when the room is opened"
         );
+    }
+
+    #[test]
+    fn inactive_room_direct_video_offer_replays_card_and_ticket() {
+        let (runtime, mut app, _local, peer) = build_join_request_test_app();
+        let _guard = runtime.enter();
+        vr_seed_friend(&mut app, peer, "Video sender");
+        let topic = direct_topic(&app.local_public, &peer);
+        let other = TopicId::from_bytes([9u8; 32]);
+        app.topic = other;
+        app.screen = Screen::Chat { topic: other };
+        let offer_id = FileOfferId::generate();
+        let hash = iroh_blobs::Hash::new(b"background video regression");
+        let ticket = BlobTicket::new(
+            iroh::EndpointAddr::new(peer),
+            hash,
+            iroh_blobs::BlobFormat::Raw,
+        )
+        .to_string();
+        let messages = [
+            Message::file_offer(offer_id, "background-video.mp4".into(), 1234).unwrap(),
+            Message::FileOfferReady {
+                offer_id,
+                ticket: ticket.clone(),
+                thumbnail_hash: None,
+            },
+        ];
+        for message in messages {
+            let _task = app.update(AppMessage::NetEvent(ConversationNetEvent::new(
+                topic,
+                NetEvent::Message {
+                    from: peer,
+                    message,
+                    sent_at: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    backfilled: false,
+                },
+            )));
+        }
+        let conv = app.conversations.get(&topic).unwrap();
+        assert_eq!(
+            conv.pending_events.len(),
+            2,
+            "offer and ticket must survive background routing"
+        );
+        assert_eq!(conv.unread, 1, "ticket upgrades are not new attachments");
+        assert!(app.switch_to_conversation(topic));
+        let _task = app.replay_pending_events_batch(topic);
+        let cards: Vec<_> = app
+            .entries
+            .iter()
+            .filter_map(|entry| entry.download.as_ref())
+            .collect();
+        assert_eq!(cards.len(), 1, "replay creates exactly one attachment card");
+        let card = cards[0];
+        assert_eq!(card.direct_offer_key, Some((peer, offer_id)));
+        assert_eq!(card.ticket, ticket);
+        assert_eq!(card.expected_content_hash, Some(hash.to_string()));
+        assert!(matches!(
+            card.state,
+            DownloadState::Ready { total: Some(1234) }
+        ));
+        assert!(matches!(
+            card.availability,
+            AttachmentAvailability::Hybrid { .. }
+        ));
+        assert!(app
+            .entries
+            .iter()
+            .any(|entry| entry.body.contains("background-video.mp4")));
+        // The card and ticket must also survive another conversation switch.
+        assert!(app.switch_to_conversation(other));
+        assert!(app.switch_to_conversation(topic));
+        assert_eq!(
+            app.entries
+                .iter()
+                .filter(|entry| entry.download.is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn direct_offer_history_restores_sender_receiver_and_missing_file() {
+        let (runtime, app, _, _) = build_join_request_test_app();
+        let _guard = runtime.enter();
+        let remote = iroh::SecretKey::generate();
+        for key in [app.secret_key.clone(), remote] {
+            let topic = TopicId::from_bytes([42; 32]);
+            let owner = key.public();
+            let offer_id = FileOfferId::generate();
+            let name = "history-video.mp4";
+            let local_path = app.data_dir.join(name);
+            std::fs::write(&local_path, b"video").unwrap();
+            let hash = iroh_blobs::Hash::new(b"video");
+            let ticket = BlobTicket::new(
+                iroh::EndpointAddr::new(owner),
+                hash,
+                iroh_blobs::BlobFormat::Raw,
+            )
+            .to_string();
+            let offer = SignedMessage::sign_and_encode(
+                &key,
+                &Message::file_offer(offer_id, name.into(), 5).unwrap(),
+            )
+            .unwrap();
+            let ready = SignedMessage::sign_and_encode(
+                &key,
+                &Message::FileOfferReady {
+                    offer_id,
+                    ticket: ticket.clone(),
+                    thumbnail_hash: Some([3; 32]),
+                },
+            )
+            .unwrap();
+            let store = MessageStore::open(&app.data_dir.join("message_store.db")).unwrap();
+            store
+                .persist_direct_offer(topic.as_bytes(), &offer, app.local_public.as_bytes(), None)
+                .unwrap();
+            store
+                .persist_direct_offer(topic.as_bytes(), &ready, app.local_public.as_bytes(), None)
+                .unwrap();
+            store
+                .set_direct_offer_local_path(
+                    topic.as_bytes(),
+                    owner.as_bytes(),
+                    offer_id,
+                    &local_path,
+                )
+                .unwrap();
+            let rows = store
+                .get_messages_for_topic(topic.as_bytes(), 100, 0)
+                .unwrap();
+            let row = rows.iter().find(|r| r.sender == *owner.as_bytes()).unwrap();
+            drop(store);
+            // Reopen SQLite from the exact production restore path, without
+            // depending on the pending event queue or in-memory file registry.
+            let entry = app.direct_offer_row_to_chat_entry(row).unwrap();
+            let dl = entry.download.unwrap();
+            assert_eq!(dl.name, name);
+            assert_eq!(dl.ticket, ticket);
+            assert_eq!(dl.direct_offer_key, Some((owner, offer_id)));
+            assert_eq!(dl.thumbnail_hash, Some([3; 32]));
+            assert_eq!(dl.expected_content_hash, Some(hash.to_string()));
+            if owner == app.local_public {
+                assert!(matches!(dl.state, DownloadState::Shared { .. }));
+            } else {
+                assert!(matches!(
+                    dl.state,
+                    DownloadState::Completed {
+                        saved_path: Some(_),
+                        ..
+                    }
+                ));
+            }
+            std::fs::remove_file(&local_path).unwrap();
+            assert!(matches!(
+                app.direct_offer_row_to_chat_entry(row)
+                    .unwrap()
+                    .download
+                    .unwrap()
+                    .state,
+                DownloadState::Ready { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn inactive_direct_offer_is_durable_before_opening_chat() {
+        let (runtime, mut app, _, _) = build_join_request_test_app();
+        let _guard = runtime.enter();
+        let key = iroh::SecretKey::generate();
+        let peer = key.public();
+        vr_seed_friend(&mut app, peer, "Persistent sender");
+        let topic = direct_topic(&app.local_public, &peer);
+        app.topic = TopicId::from_bytes([9;32]);
+        app.screen = Screen::ChatList;
+        let id = FileOfferId::generate();
+        let ticket = BlobTicket::new(iroh::EndpointAddr::new(peer), iroh_blobs::Hash::new(b"video"), iroh_blobs::BlobFormat::Raw).to_string();
+        for message in [Message::file_offer(id, "inactive-history.mp4".into(), 5).unwrap(),
+            Message::FileOfferReady { offer_id: id, ticket: ticket.clone(), thumbnail_hash: None }] {
+            let signed = SignedMessage::sign_and_encode(&key, &message).unwrap();
+            let (_, _, sent_at) = SignedMessage::verify_and_decode(&signed).unwrap();
+            boru_core::chat_core::remember_signed_message(peer, &message, sent_at, &signed);
+            let _task = app.update(AppMessage::NetEvent(ConversationNetEvent::new(topic,
+                NetEvent::Message { from: peer, message, sent_at, backfilled: false })));
+        }
+        let store = MessageStore::open(&app.data_dir.join("message_store.db")).unwrap();
+        let rows = store.get_messages_for_topic(topic.as_bytes(), 100, 0).unwrap();
+        assert_eq!(rows.len(), 1, "inactive offers must survive without replay");
+        app.conversations.clear();
+        app.entries.clear();
+        let entry = app.direct_offer_row_to_chat_entry(&rows[0]).unwrap();
+        assert_eq!(entry.download.unwrap().ticket, ticket);
     }
 
     #[test]
