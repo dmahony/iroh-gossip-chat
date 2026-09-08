@@ -1,5 +1,6 @@
 //! Home network information: bounded HTTPS IP fallback, offline geolocation.
 mod public_ip;
+use crate::control_plane::message::CoarsePresence;
 use iroh::{Endpoint, EndpointAddr, TransportAddr, Watcher};
 use maxminddb::Reader;
 use n0_future::StreamExt;
@@ -11,7 +12,7 @@ use std::{
 };
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-/// Display-only local network details; never broadcast to peers.
+/// Local display details. Only separately derived coarse coordinates are shared.
 pub struct Snapshot {
     /// Endpoint addresses and, when needed, HTTPS-observed public addresses.
     pub addresses: String,
@@ -30,12 +31,19 @@ impl Default for Snapshot {
 #[derive(Deserialize)]
 struct Place {
     names: Option<BTreeMap<String, String>>,
+    iso_code: Option<String>,
+}
+#[derive(Deserialize)]
+struct Coordinates {
+    latitude: Option<f64>,
+    longitude: Option<f64>,
 }
 #[derive(Deserialize)]
 struct Record {
     city: Option<Place>,
     subdivisions: Option<Vec<Place>>,
     country: Option<Place>,
+    location: Option<Coordinates>,
 }
 fn english(place: Option<Place>) -> Option<String> {
     place?.names?.remove("en")
@@ -117,11 +125,78 @@ fn snapshot(address: &EndpointAddr, reader: Option<&Reader<Vec<u8>>>) -> Snapsho
     }
 }
 
-/// Watch endpoint changes and resolve local-only geography off the GUI thread.
-pub fn start(runtime: &tokio::runtime::Handle, endpoint: Endpoint) -> Arc<Mutex<Snapshot>> {
+/// Receiver for coarse map metadata on the existing presence heartbeat.
+pub type PresenceSink = Arc<dyn Fn(Option<CoarsePresence>) + Send + Sync>;
+
+fn sharing_enabled(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+fn coarse_location(
+    address: &EndpointAddr,
+    reader: Option<&Reader<Vec<u8>>>,
+    fallback: &[std::net::IpAddr],
+) -> Option<CoarsePresence> {
+    let mut ips = address
+        .addrs
+        .iter()
+        .filter_map(|addr| match addr {
+            TransportAddr::Ip(addr) => Some(addr.ip()),
+            _ => None,
+        })
+        .chain(fallback.iter().copied());
+    ips.find_map(|ip| {
+        if !crate::network_location::is_public_ip(ip) {
+            return None;
+        }
+        let record = reader?.lookup(ip).ok()?.decode::<Record>().ok()??;
+        let location = record.location?;
+        let latitude = location.latitude?;
+        let longitude = location.longitude?;
+        if !latitude.is_finite()
+            || !longitude.is_finite()
+            || !(-90.0..=90.0).contains(&latitude)
+            || !(-180.0..=180.0).contains(&longitude)
+        {
+            return None;
+        }
+        CoarsePresence {
+            country_code: record.country.and_then(|country| country.iso_code),
+            latitude: Some((latitude * 10.0).round() / 10.0),
+            longitude: Some((longitude * 10.0).round() / 10.0),
+            asn: None,
+        }
+        .sanitized()
+    })
+}
+
+/// Resolve geography off the GUI thread and share coarse map metadata by
+/// default. `BORU_SHARE_MAP_LOCATION=0` opts out without disabling local details.
+pub fn start(
+    runtime: &tokio::runtime::Handle,
+    endpoint: Endpoint,
+    sink: Option<PresenceSink>,
+) -> Arc<Mutex<Snapshot>> {
     let state = Arc::new(Mutex::new(Snapshot::default()));
     let output = Arc::clone(&state);
+    let share = sharing_enabled(std::env::var("BORU_SHARE_MAP_LOCATION").ok().as_deref());
     runtime.spawn(async move {
+        let publish = |address: &EndpointAddr,
+                       reader: Option<&Reader<Vec<u8>>>,
+                       fallback: &[std::net::IpAddr]| {
+            if let Some(sink) = &sink {
+                sink(if share {
+                    coarse_location(address, reader, fallback)
+                } else {
+                    None
+                });
+            }
+        };
         // Decompression and file IO must not block the GUI or networking workers.
         let reader = tokio::task::spawn_blocking(|| {
             if let Some(path) = std::env::var_os("BORU_GEOIP_CITY") {
@@ -143,6 +218,7 @@ pub fn start(runtime: &tokio::runtime::Handle, endpoint: Endpoint) -> Arc<Mutex<
         let mut current = endpoint.addr();
         let mut delay = std::time::Duration::ZERO;
         let mut retry_secs = 30u64;
+        publish(&current, reader.as_ref(), &[]);
         if let Ok(mut value) = output.lock() {
             *value = snapshot(&current, reader.as_ref());
         }
@@ -154,6 +230,7 @@ pub fn start(runtime: &tokio::runtime::Handle, endpoint: Endpoint) -> Arc<Mutex<
                     let Some(address) = address else { break; };
                     if address == current { continue; }
                     current = address;
+                    publish(&current, reader.as_ref(), &[]);
                     if let Ok(mut value) = output.lock() {
                         *value = snapshot(&current, reader.as_ref());
                     }
@@ -169,6 +246,7 @@ pub fn start(runtime: &tokio::runtime::Handle, endpoint: Endpoint) -> Arc<Mutex<
                     [v4, v6].into_iter().flatten().collect::<Vec<_>>()
                 } => {
                     let resolved = snapshot_with_fallback(&current, reader.as_ref(), &fallback);
+                    publish(&current, reader.as_ref(), &fallback);
                     if let Ok(mut value) = output.lock() { *value = resolved; }
                     // A failed refresh removes stale HTTPS results rather than
                     // presenting an old ISP/VPN exit as current indefinitely.
@@ -181,6 +259,9 @@ pub fn start(runtime: &tokio::runtime::Handle, endpoint: Endpoint) -> Arc<Mutex<
                     }
                 }
             }
+        }
+        if let Some(sink) = &sink {
+            sink(None);
         }
     });
     state
@@ -231,6 +312,50 @@ fn snapshot_with_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_sharing_defaults_on_and_supports_opt_out() {
+        assert!(sharing_enabled(None));
+        assert!(sharing_enabled(Some("1")));
+        for value in ["0", "false", "OFF", "no"] {
+            assert!(!sharing_enabled(Some(value)));
+        }
+    }
+
+    #[test]
+    fn shared_fallback_location_reaches_map_and_clears() {
+        use crate::control_plane::{message::ControlEnvelope, privacy::PeerControlStateStore};
+        let reader = bundled_reader().unwrap();
+        let endpoint = address(&["192.168.1.20:1234"]);
+        let coarse =
+            coarse_location(&endpoint, Some(&reader), &["8.8.8.8".parse().unwrap()]).unwrap();
+        for coordinate in [coarse.latitude.unwrap(), coarse.longitude.unwrap()] {
+            assert!((coordinate * 10.0 - (coordinate * 10.0).round()).abs() < 1e-8);
+        }
+        let node = iroh_base::SecretKey::from_bytes(&[3; 32]).public();
+        let now = std::time::Instant::now();
+        let mut store = PeerControlStateStore::with_limits(16, std::time::Duration::from_secs(60));
+        store.record(
+            &ControlEnvelope::presence_with_coarse(node, 1, 1_700_000_000, None, Some(coarse)),
+            now,
+        );
+        assert_eq!(
+            crate::network_map::NetworkMapState::from_presence(&store, now)
+                .points
+                .len(),
+            1
+        );
+        let unavailable = coarse_location(&endpoint, Some(&reader), &[]);
+        assert!(unavailable.is_none());
+        store.record(
+            &ControlEnvelope::presence_with_coarse(node, 2, 1_700_000_001, None, unavailable),
+            now,
+        );
+        let cleared = crate::network_map::NetworkMapState::from_presence(&store, now);
+        assert!(cleared.points.is_empty());
+        assert_eq!(cleared.nodes_online, 1);
+        assert_eq!(endpoint.addrs.len(), 1);
+    }
     #[test]
     fn fallback_resolves_private_only_endpoint_without_mutating_it() {
         let reader = bundled_reader().unwrap();

@@ -1357,6 +1357,7 @@ fn main() -> Result<()> {
         // Keep coarse presence on the same live heartbeat. GeoIP is optional
         // and local; missing database paths leave normal online/TTL semantics
         // unchanged while announcing no map metadata.
+        #[cfg(not(feature = "gui"))]
         if let Some(service) = &discovery_service {
             let city = std::env::var_os("BORU_GEOIP_CITY").map(PathBuf::from);
             let asn = std::env::var_os("BORU_GEOIP_ASN").map(PathBuf::from);
@@ -2042,7 +2043,11 @@ fn main() -> Result<()> {
             app.network_map_source = _discovery_service
                 .as_ref()
                 .map(|svc| svc.network_map_source());
-            app.home_network_info = Some(home_network_info::start(runtime.handle(), endpoint.clone()));
+            app.home_network_info = Some(home_network_info::start(
+                runtime.handle(),
+                endpoint.clone(),
+                _discovery_service.as_ref().map(|service| service.coarse_presence_sink()),
+            ));
             // BORU-CP-12: give the UI a read-only handle to the
             // negotiated-capability view (PDF Task 4.3) so optional
             // features (voice/video calls, screen share, file transfer,

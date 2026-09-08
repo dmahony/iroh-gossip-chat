@@ -72,6 +72,11 @@ fn dep(variant: HomeConnectionVariant, width: f32) -> StatusCardDependency {
         network_nodes_online: 0,
         network_countries: 0,
         network_networks: 0,
+        health_label: "Healthy".into(),
+        direct_peers: 0,
+        relayed_peers: 0,
+        neighbor_count: 0,
+        encryption_status: "Encrypted".into(),
         accent_color: crate::theme::BoruTheme::default().colors.primary,
         dark_mode: false,
     }
@@ -330,13 +335,28 @@ mod tests {
     }
 
     #[test]
-    fn ready_card_lands_in_compact_band() {
-        // POLISH-02 (spec §4): the tightened hero card must be
-        // ~180-210px tall at Full tier — content-determined, not fixed.
-        // The vertical padding was reduced from 24px to 12px, cutting
-        // ~24px from the total height (~11% reduction).
-        // Medium tier allows growth up to 220 for wrapped text; the card
-        // grows only when its content requires it (requirement 3).
+    fn online_location_light_changes_rendered_pixels_and_clears() {
+        let mut state = dep(HomeConnectionVariant::Ready, 1215.0);
+        render_card(&state, 1215.0, 360.0, "map_no_locations");
+        state.network_map_points.push(crate::app::NetworkMapPointSnapshot {
+            node_id: iroh_base::SecretKey::from_bytes(&[1; 32]).public(),
+            latitude_bits: 0.0f64.to_bits(),
+            longitude_bits: 0.0f64.to_bits(),
+        });
+        render_card(&state, 1215.0, 360.0, "map_online_location");
+        state.network_map_points.clear();
+        render_card(&state, 1215.0, 360.0, "map_location_expired");
+        let read = |name| image::open(format!("{CAPTURE_DIR}/{name}.png")).unwrap().to_rgba8();
+        let empty = read("map_no_locations");
+        let online = read("map_online_location");
+        let expired = read("map_location_expired");
+        assert_ne!(empty, online, "Live coordinates must change actual rendered pixels");
+        assert_eq!(empty, expired, "Expired locations must leave no stale light");
+    }
+
+    #[test]
+    fn ready_card_accommodates_enlarged_map() {
+        // The 1.5x map is 240px / 195px high, plus card padding.
         load_font(include_bytes!("fonts/InterTight-Bold.ttf"));
         load_font(include_bytes!("fonts/PublicSans-Regular.ttf"));
         load_font(include_bytes!("fonts/PublicSans-Medium.ttf"));
@@ -348,13 +368,13 @@ mod tests {
         // gaps tightened).
         let full = measure_card_height(&dep(HomeConnectionVariant::Ready, 1215.0), 1215.0);
         assert!(
-            (180.0..=210.0).contains(&full),
-            "Ready Full card height {full:.1}px must land in the 180-210px band"
+            (256.0..=280.0).contains(&full),
+            "Ready Full card height {full:.1}px must accommodate the enlarged map"
         );
         // Minimum supported window (1024 → ~679 content) — medium row.
         let medium = measure_card_height(&dep(HomeConnectionVariant::Ready, 679.0), 679.0);
         assert!(
-            (140.0..=200.0).contains(&medium),
+            (211.0..=240.0).contains(&medium),
             "Ready Medium card height {medium:.1}px must stay compact (single-line heading; wrapped-growth allowed)"
         );
     }

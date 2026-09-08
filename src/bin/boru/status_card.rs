@@ -81,7 +81,7 @@ const STATUS_CARD_TEXT_MIN_WIDTH_MEDIUM: f32 = 260.0;
 /// card without starving the connection text. The mesh must
 /// NEVER consume width the heading needs: it only gets the leftover after
 /// the text minimum is satisfied.
-pub(crate) const STATUS_CARD_MESH_MAX_WIDTH: f32 = 340.0;
+pub(crate) const STATUS_CARD_MESH_MAX_WIDTH: f32 = 510.0;
 
 /// Horizontal padding of the card (px), spec §5 band 24–28 px. CONN-05:
 /// reduced from 32 (CONN-04 had already trimmed the vertical padding to
@@ -123,8 +123,8 @@ pub(crate) struct StatusCardDependency {
     pub(crate) show_retry: bool,
     /// Show the Details action (Offline / Degraded).
     pub(crate) show_details: bool,
-    /// Retained for the shared home-card update cadence. The map itself is
-    /// static so it cannot suggest live network topology.
+    /// Shared home-card update cadence. Location lights are steady, not
+    /// synthetic network-traffic animations.
     pub(crate) pulse_frame: u32,
     /// Retained for compatibility with the home status snapshot.
     pub(crate) animate_mesh: bool,
@@ -759,9 +759,9 @@ fn actions_row(show_retry: bool, show_details: bool) -> iced::Element<'static, A
 /// this nominal size is never laid out at those widths.
 fn network_size(tier: Tier, sizing: crate::layout::HomeCardSizing) -> (f32, f32) {
     match tier {
-        Tier::Full => (sizing.status_card_mesh_max_width, 160.0),
-        Tier::Medium => (sizing.status_card_mesh_max_width, 130.0),
-        Tier::Narrow => (220.0, 110.0),
+        Tier::Full => (sizing.status_card_mesh_max_width, 240.0),
+        Tier::Medium => (sizing.status_card_mesh_max_width, 195.0),
+        Tier::Narrow => (330.0, 165.0),
     }
 }
 
@@ -814,10 +814,63 @@ fn network_map(
     // image handle stable across those renders; constructing a new handle
     // each time makes Iced repeatedly discard/redecode the map and causes a
     // visible flash while the card is refreshed.
-    image(world_map_handle())
+    let background = image(world_map_handle())
+        .content_fit(iced::ContentFit::Contain)
         .width(Length::Fixed(width))
-        .height(Length::Fixed(h))
-        .into()
+        .height(Length::Fixed(h));
+    // Keep the raster separate: embedding it inside SVG can overflow the
+    // Windows parser stack. Both layers use the same contain-fitted viewport.
+    let lights = svg(map_lights_handle(dep, width, h))
+        .content_fit(iced::ContentFit::Fill)
+        .width(Length::Fixed(width))
+        .height(Length::Fixed(h));
+    iced::widget::stack![background, lights].into()
+}
+
+fn map_lights_handle(dep: &StatusCardDependency, width: f32, height: f32) -> svg::Handle {
+    let mut points = dep.network_map_points.iter().map(|point| {
+        (point.node_id, point.latitude_bits, point.longitude_bits)
+    }).collect::<Vec<_>>();
+    points.sort_unstable();
+    let key = MapCacheKey {
+        width_bits: width.to_bits(),
+        height_bits: height.to_bits(),
+        points,
+        accent: [dep.accent_color.r.to_bits(), dep.accent_color.g.to_bits(), dep.accent_color.b.to_bits()],
+    };
+    let mut cache = network_map_cache().lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(handle) = cache.get(&key) {
+        return handle.clone();
+    }
+    let handle = svg::Handle::from_memory(map_lights_svg(&key).into_bytes());
+    if cache.len() >= 32 {
+        cache.clear();
+    }
+    cache.insert(key, handle.clone());
+    handle
+}
+
+fn map_lights_svg(key: &MapCacheKey) -> String {
+    let width = f64::from(f32::from_bits(key.width_bits)).max(1.0);
+    let height = f64::from(f32::from_bits(key.height_bits)).max(1.0);
+    let scale = (width / 1448.0).min(height / 1086.0);
+    let map_width = 1448.0 * scale;
+    let map_height = 1086.0 * scale;
+    let left = (width - map_width) / 2.0;
+    let top = (height - map_height) / 2.0;
+    let points = key.points.iter().filter_map(|(node_id, latitude, longitude)| {
+        let (x, y) = project_point(f64::from_bits(*latitude), f64::from_bits(*longitude), map_width, map_height)?;
+        Some(ProjectedMapPoint { node_id: *node_id, x: left + x, y: top + y })
+    }).collect::<Vec<_>>();
+    let [r, g, b] = key.accent.map(|bits| (f32::from_bits(bits).clamp(0.0, 1.0) * 255.0).round() as u8);
+    let mut output = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">"#);
+    for point in spread_overlapping_points(&points) {
+        let x = point.x.clamp(left, left + map_width);
+        let y = point.y.clamp(top, top + map_height);
+        output.push_str(&format!(r#"<g fill="rgb({r},{g},{b})"><circle cx="{x}" cy="{y}" r="7" opacity="0.18"/><circle cx="{x}" cy="{y}" r="4" opacity="0.45"/><circle cx="{x}" cy="{y}" r="2"/></g>"#));
+    }
+    output.push_str("</svg>");
+    output
 }
 
 fn world_map_handle() -> image::Handle {
@@ -932,6 +985,32 @@ pub(crate) fn network_mesh_for_debug(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_sizes_are_one_and_a_half_times_previous_defaults() {
+        let sizing = crate::layout::HomeCardSizing::default();
+        assert_eq!(network_size(Tier::Full, sizing), (510.0, 240.0));
+        assert_eq!(network_size(Tier::Medium, sizing), (510.0, 195.0));
+        assert_eq!(network_size(Tier::Narrow, sizing), (330.0, 165.0));
+    }
+
+    #[test]
+    fn lights_follow_live_points_and_clear_when_they_disappear() {
+        let mut key = MapCacheKey {
+            width_bits: 510.0f32.to_bits(),
+            height_bits: 240.0f32.to_bits(),
+            points: vec![(iroh_base::SecretKey::from_bytes(&[1; 32]).public(), 0.0f64.to_bits(), 0.0f64.to_bits())],
+            accent: [0.0f32.to_bits(), 1.0f32.to_bits(), 0.0f32.to_bits()],
+        };
+        let lit = map_lights_svg(&key);
+        assert_eq!(lit.matches("<circle").count(), 3);
+        assert!(lit.contains("cx=\"255\" cy=\"120\""));
+        assert!(!lit.contains("data:image"));
+        key.points.clear();
+        assert!(!map_lights_svg(&key).contains("<circle"));
+        key.points.push((iroh_base::SecretKey::from_bytes(&[2; 32]).public(), f64::NAN.to_bits(), 0.0f64.to_bits()));
+        assert!(!map_lights_svg(&key).contains("<circle"));
+    }
 
     #[test]
     fn network_stats_use_singular_only_for_one() {

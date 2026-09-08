@@ -18,12 +18,14 @@ on a background worker. No separate installation or online geolocation is needed
 override falls back to the bundled copy.
 
 Location is approximate, may describe an ISP or VPN exit, and can be stale.
-Only the local Home card receives these details; they are not added to peer
-presence or persisted as user data. Public IPs come from Iroh endpoint address
+The desktop shares approximate coordinates (rounded to 0.1 degrees) and country
+on the existing presence heartbeat by default so online peers can light up the
+map. Set `BORU_SHARE_MAP_LOCATION=0` to opt out. Full Home location text and raw
+IPs are not added to presence or persisted as user data. Public IPs come from Iroh endpoint address
 discovery first. Missing IPv4/IPv6 families use bounded HTTPS lookups with
 ipify and independent AWS/icanhazip fallbacks. These services see the connection
 address, but receive no Boru identity or chat data. Requests use OS routing,
-not HTTP proxies; VPN routing still applies. HTTPS results are display-only,
+not HTTP proxies; VPN routing still applies. HTTPS results feed local display and coarse map geography,
 never installed as QUIC endpoint addresses. Responses are limited to 64 bytes,
 validated as public IPs, and redirects are disabled. Location remains offline.
 Refresh occurs after address changes and every five minutes on success;
