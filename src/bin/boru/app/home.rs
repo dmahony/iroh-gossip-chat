@@ -8,6 +8,8 @@
 //! with `use home::*`.
 
 use super::*;
+#[path = "network_connection.rs"]
+mod network_connection;
 
 /// Hash-compatible snapshot of [`MeshHealth`] for use inside screen
 /// dependencies. The reason strings are the only data the renderers read from
@@ -72,7 +74,8 @@ pub(crate) struct ChatListDependency {
     pub(crate) local_label: String,
     pub(crate) time_of_day_greeting: String,
     pub(crate) has_peer_connections: bool,
-    pub(crate) sender_ready: bool,
+    /// Live endpoint connectivity, independent of a selected chat sender.
+    pub(crate) relay_connected: bool,
     pub(crate) direct_peers: u32,
     pub(crate) relayed_peers: u32,
     pub(crate) neighbors_len: u32,
@@ -1180,7 +1183,12 @@ impl IcedChat {
             local_label: self.local_label.clone(),
             time_of_day_greeting: self.time_of_day_greeting().to_string(),
             has_peer_connections,
-            sender_ready: self.sender.is_some(),
+            relay_connected: self
+                .endpoint
+                .home_relay_status()
+                .get()
+                .iter()
+                .any(|s| s.is_connected()),
             direct_peers: self.direct_peers as u32,
             relayed_peers: self.relayed_peers as u32,
             neighbors_len: self.neighbors.len() as u32,
@@ -1219,9 +1227,14 @@ impl IcedChat {
         use iced::{Alignment, Background, Border, Color, ContentFit, Length, Radians};
 
         let hero_height = (window_height * 0.30).clamp(220.0, 320.0);
-        let connected = dep.has_peer_connections;
-        let status = if connected { "Connected" } else { "Waiting for peers" };
-        let transport = if connected { "Direct P2P" } else { "Relay standby" };
+        let connected =
+            network_connection::network_connected(dep.relay_connected, dep.has_peer_connections);
+        let status = if connected { "Connected" } else { "Connecting" };
+        let transport = network_connection::transport_label(
+            dep.relay_connected,
+            dep.direct_peers,
+            dep.relayed_peers,
+        );
         let friends = dep.people_activity.online.total_friends.to_string();
 
         let metric = |icon: &'static [u8], label: String, value: String| {
@@ -1381,9 +1394,16 @@ impl IcedChat {
 
         // ── Connection state (single source of truth) ──
         let has_peer_connections = dep.has_peer_connections;
-        let relay_reachable = dep.sender_ready || has_peer_connections;
+        let relay_reachable =
+            network_connection::network_connected(dep.relay_connected, has_peer_connections);
         let mesh_health = dep.mesh_health.as_mesh_health();
-        let variant = home_connection_variant(&mesh_health, has_peer_connections, relay_reachable);
+        // Network connectivity is not the active room's readiness. A live
+        // relay is connected even before a room or peer has been selected.
+        let variant = if relay_reachable {
+            HomeConnectionVariant::Ready
+        } else {
+            home_connection_variant(&mesh_health, false, false)
+        };
 
         // ── Hero variant visuals (truthful, from the pure mapping above) ──
         let headline: String = match variant {
@@ -1516,7 +1536,7 @@ impl IcedChat {
             MeshHealth::Offline(_) => (crate::i18n::t("status.offline"), color_error),
         };
         let mesh_has_peers = dep.has_peer_connections;
-        let mesh_relay_reachable = dep.sender_ready || mesh_has_peers;
+        let mesh_relay_reachable = dep.relay_connected || mesh_has_peers;
         let mesh_variant =
             home_connection_variant(&mesh_health, mesh_has_peers, mesh_relay_reachable);
 
