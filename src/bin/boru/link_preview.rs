@@ -17,7 +17,7 @@
 //!   errors, 10m for successes).
 
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -54,23 +54,7 @@ const MAX_CONCURRENT_FETCHES: usize = 8;
 /// streaming so large pages never fully buffer in memory.
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
-// ── Shared HTTP client ─────────────────────────────────────────────────
-
-/// One reusable `reqwest::Client` configured with a short timeout, a
-/// descriptive user-agent, a redirect limit, and rustls TLS. Built once
-/// via `LazyLock` — avoids recreating a TLS session and connection pool
-/// on every preview fetch.
-static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        // Do not identify the Boru installation or room to the remote site.
-        .user_agent("Mozilla/5.0")
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("Failed to build reqwest::Client configured for link previews")
-});
-
-/// Semaphore limiting concurrent outbound preview requests. Prevents a flood
+/// Semaphore limiting concurrent link preview fetches. Prevents a flood
 /// of slow or hanging URLs from exhausting system resources.
 static PREVIEW_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_FETCHES));
@@ -343,10 +327,13 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// Validate a preview URL and all addresses returned for its hostname.
+/// Resolve and validate a preview URL, returning the exact addresses that may
+/// be used for the connection. The caller must pin these addresses on its
+/// reqwest client; resolving again at connect time would reintroduce a DNS
+/// time-of-check/time-of-use gap.
 /// DNS failures are rejected closed. Redirects are disabled on the client and
 /// callers validate every redirect target before following it.
-async fn validate_preview_url(url: &Url) -> Result<(), String> {
+async fn validate_preview_url(url: &Url) -> Result<Vec<SocketAddr>, String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err("only HTTP(S) preview URLs are allowed".into());
     }
@@ -360,28 +347,48 @@ async fn validate_preview_url(url: &Url) -> Result<(), String> {
     let port = url
         .port_or_known_default()
         .ok_or_else(|| "preview URL has no valid port".to_string())?;
-    let addresses: Vec<IpAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
-        vec![ip]
+    let addresses: Vec<SocketAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
     } else {
         tokio::net::lookup_host((host, port))
             .await
             .map_err(|_| "preview hostname could not be resolved".to_string())?
-            .map(|address| address.ip())
             .collect()
     };
 
-    if addresses.is_empty() || addresses.iter().any(|ip| is_blocked_ip(*ip)) {
+    if addresses.is_empty() || addresses.iter().any(|address| is_blocked_ip(address.ip())) {
         return Err("preview target resolves to a private or reserved address".into());
     }
-    Ok(())
+    Ok(addresses)
+}
+
+/// Build a client whose resolver can only return the already-validated
+/// addresses. The URL still contains the original hostname, so reqwest/rustls
+/// retain the correct HTTP Host header and TLS SNI while the socket connects
+/// to one of these exact addresses.
+fn pinned_http_client(host: &str, addresses: &[SocketAddr]) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .user_agent("Mozilla/5.0")
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .resolve_to_addrs(host, addresses)
+        .build()
+        .map_err(|error| format!("build preview client: {error}"))
 }
 
 /// Fetch a URL while validating the initial target and every redirect target.
 async fn fetch_preview_response(url: &Url) -> Result<reqwest::Response, String> {
     let mut current = url.clone();
     for _ in 0..=5 {
-        validate_preview_url(&current).await?;
-        let response = HTTP_CLIENT
+        let addresses = validate_preview_url(&current).await?;
+        let client = pinned_http_client(
+            current
+                .host_str()
+                .ok_or_else(|| "preview URL has no host".to_string())?,
+            &addresses,
+        )?;
+        let response = client
             .get(current.clone())
             .header(reqwest::header::DNT, "1")
             .header("Sec-GPC", "1")
@@ -586,7 +593,10 @@ async fn fetch_youtube_oembed(url: &str) -> Option<LinkPreviewData> {
         "https://www.youtube.com/oembed?format=json&url=https://www.youtube.com/watch?v={video_id}"
     );
 
-    let response = HTTP_CLIENT.get(&oembed_url).send().await.ok()?;
+    let oembed_parsed = Url::parse(&oembed_url).ok()?;
+    let addresses = validate_preview_url(&oembed_parsed).await.ok()?;
+    let client = pinned_http_client(oembed_parsed.host_str()?, &addresses).ok()?;
+    let response = client.get(oembed_parsed).send().await.ok()?;
 
     let body = stream_body_with_limit(response, 64 * 1024).await.ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&body).ok()?;
@@ -1053,6 +1063,23 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn preview_validation_returns_the_addresses_to_pin() {
+        let url = Url::parse("https://1.1.1.1/example").unwrap();
+        let addresses = validate_preview_url(&url).await.unwrap();
+        assert_eq!(addresses, vec![SocketAddr::from(([1, 1, 1, 1], 443))]);
+
+        let client = pinned_http_client("1.1.1.1", &addresses).unwrap();
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn preview_validation_rejects_private_dns_results() {
+        let url = Url::parse("http://localhost/").unwrap();
+        let error = validate_preview_url(&url).await.unwrap_err();
+        assert!(error.contains("private or reserved"), "{error}");
+    }
+
     #[test]
     fn preview_image_must_be_same_origin() {
         let page = Url::parse("https://example.com/article").unwrap();
@@ -1223,14 +1250,6 @@ mod tests {
         assert_eq!(MAX_BODY_BYTES, 262_144);
         // The stream_body_with_limit function is exercised at integration
         // level by the fetch_link_preview tests (which use the cap internally).
-    }
-
-    /// Verify the static HTTP client initializes correctly.
-    #[test]
-    fn test_http_client_is_built() {
-        let client = &*HTTP_CLIENT;
-        // Client should be a valid reqwest::Client
-        let _ = client;
     }
 
     /// Verify the semaphore is configured with the expected permit count.
