@@ -62,8 +62,15 @@ use crate::mailbox::{MailboxAck, MailboxEnvelope, MAX_SYNC_LOOKBACK};
 
 /// Callback that provides pending envelopes for a SyncRequest.
 type PendingFn = Option<Arc<dyn Fn(PublicKey, u64) -> (Vec<MailboxEnvelope>, bool) + Send + Sync>>;
-/// Callback invoked after a SyncResponse is sent, recording which message IDs were served.
-type RecordSyncFn = Option<Arc<dyn Fn(PublicKey, &[[u8; 32]]) + Send + Sync>>;
+/// Callback invoked after a SyncResponse is acknowledged, recording which message IDs were served.
+///
+/// The callback returns an error so a durable replay marker is never silently
+/// treated as committed when persistence fails.
+type RecordSyncFn = Option<Arc<dyn Fn(PublicKey, &[[u8; 32]]) -> Result<()> + Send + Sync>>;
+
+/// Byte written by a sync requester after it has received and verified a
+/// SyncResponse.  The server records replay markers only after this ack.
+const SYNC_RESPONSE_ACK: u8 = 1;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -353,11 +360,11 @@ pub struct InboxInner {
     /// (envelopes, has_more). The protocol handler derives last_created_at_ms
     /// from the last envelope in the page.
     pub pending_fn: PendingFn,
-    /// Optional callback invoked after a SyncResponse is sent, recording
-    /// which message IDs were served for replay protection.  The callback
-    /// receives (recipient_public_key, &[[u8; 32]]).
-    /// This prevents the same envelopes from being served again on repeat
-    /// sync requests.
+    /// Optional callback invoked after a SyncResponse is acknowledged,
+    /// recording which message IDs were served for replay protection.  The
+    /// callback receives (recipient_public_key, &[[u8; 32]]) and can reject
+    /// the durable commit if persistence fails.  This prevents the same
+    /// envelopes from being served again on repeat sync requests.
     pub record_sync_served_fn: RecordSyncFn,
 }
 
@@ -641,7 +648,9 @@ impl ProtocolHandler for InboxProtocol {
                         })
                         .collect();
 
-                    // SyncRequest: send back a paginated SyncResponse.
+                    // SyncRequest: send back a paginated SyncResponse.  Do not
+                    // record the envelopes as served until the requester has
+                    // acknowledged receipt below.
                     if let Some(ref sk) = secret_key {
                         let last_created_at_ms = response_envelopes.last().map(|e| e.created_at());
                         let payload = InboxPayload::SyncResponse {
@@ -652,8 +661,59 @@ impl ProtocolHandler for InboxProtocol {
                         match SignedInboxMessage::sign(sk, payload) {
                             Ok(signed) => {
                                 let resp_len = signed.len() as u32;
-                                let _ = send.write_all(&resp_len.to_be_bytes()).await;
-                                let _ = send.write_all(&signed).await;
+                                if let Err(e) = send.write_all(&resp_len.to_be_bytes()).await {
+                                    tracing::warn!(
+                                        "inbox: failed to write SyncResponse length to {}: {e}",
+                                        remote_id.fmt_short()
+                                    );
+                                    continue;
+                                }
+                                if let Err(e) = send.write_all(&signed).await {
+                                    tracing::warn!(
+                                        "inbox: failed to write SyncResponse to {}: {e}",
+                                        remote_id.fmt_short()
+                                    );
+                                    continue;
+                                }
+
+                                // The response is not durable delivery yet:
+                                // the requester must acknowledge the verified
+                                // page on the reverse direction of this stream.
+                                let mut ack = [0u8; 1];
+                                let ack_result = tokio::time::timeout(
+                                    Duration::from_secs(10),
+                                    recv.read_exact(&mut ack),
+                                )
+                                .await;
+                                if !matches!(ack_result, Ok(Ok(())))
+                                    || ack[0] != SYNC_RESPONSE_ACK
+                                {
+                                    tracing::warn!(
+                                        "inbox: SyncResponse acknowledgement missing or invalid from {}",
+                                        remote_id.fmt_short()
+                                    );
+                                    continue;
+                                }
+
+                                if let Err(e) = send.finish() {
+                                    tracing::warn!(
+                                        "inbox: failed to finish SyncResponse to {}: {e}",
+                                        remote_id.fmt_short()
+                                    );
+                                    continue;
+                                }
+
+                                if !msg_ids.is_empty() {
+                                    let guard = inner.lock().await;
+                                    if let Some(ref record_fn) = guard.record_sync_served_fn {
+                                        if let Err(e) = record_fn(remote_id, &msg_ids) {
+                                            tracing::warn!(
+                                                "inbox: failed to record SyncResponse delivery to {}: {e}",
+                                                remote_id.fmt_short()
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -669,17 +729,6 @@ impl ProtocolHandler for InboxProtocol {
                         );
                     }
 
-                    // Record served message IDs for replay protection so that
-                    // subsequent sync requests from the same peer do not re-serve
-                    // the same envelopes.  The frontend wires this callback to a
-                    // store (e.g. Storage::record_sync_served or an in-memory set)
-                    // that the pending_fn also consults for filtering.
-                    if !msg_ids.is_empty() {
-                        let guard = inner.lock().await;
-                        if let Some(ref record_fn) = guard.record_sync_served_fn {
-                            record_fn(remote_id, &msg_ids);
-                        }
-                    }
                 }
                 Ok(None) => {
                     // Non-SyncRequest messages get a minimal ack.
@@ -1018,20 +1067,31 @@ pub async fn send_sync_request(
     // Verify the response.
     let (_sender, payload, _sent_at) = SignedInboxMessage::verify(&resp_buf, Some(peer))?;
 
-    match payload {
+    let page = match payload {
         InboxPayload::SyncResponse {
             envelopes,
             last_created_at_ms,
             has_more,
-        } => Ok(SyncResponsePage {
+        } => SyncResponsePage {
             envelopes,
             last_created_at_ms,
             has_more,
-        }),
-        other => Err(n0_error::anyerr!(
+        },
+        other => return Err(n0_error::anyerr!(
             "unexpected sync response payload: {other:?}"
         )),
-    }
+    };
+
+    // A response is acknowledged only after its signature and payload have
+    // been verified.  The server uses this byte as the commit point for its
+    // replay marker; failures leave the page retryable.
+    send.write_all(&[SYNC_RESPONSE_ACK])
+        .await
+        .std_context("write sync response acknowledgement")?;
+    send.finish()
+        .std_context("finish sync response acknowledgement")?;
+
+    Ok(page)
 }
 
 /// Send a delete tombstone for a message to a peer's inbox.
@@ -1564,6 +1624,7 @@ mod tests {
                 for id in msg_ids {
                     ids.push(*id);
                 }
+                Ok(())
             })))
             .await;
 
@@ -1583,7 +1644,7 @@ mod tests {
             let inner = handle.inner();
             let guard = inner.lock().await;
             if let Some(ref record_fn) = guard.record_sync_served_fn {
-                record_fn(sk.public(), &[expected_mid]);
+                record_fn(sk.public(), &[expected_mid]).unwrap();
             }
         }
 
@@ -1594,6 +1655,27 @@ mod tests {
             ids[0], expected_mid,
             "captured ID should match computed inbox_message_id"
         );
+    }
+
+    /// A failed durable replay-marker write must remain observable to the
+    /// protocol handler instead of being treated as a successful commit.
+    #[tokio::test]
+    async fn record_sync_served_fn_propagates_persistence_failure() {
+        let sk = test_secret_key();
+        let (handle, _rx) = InboxHandle::new();
+        handle
+            .set_record_sync_served_fn(Some(Arc::new(move |_peer, _msg_ids| {
+                Err(n0_error::anyerr!("injected sync dedup write failure"))
+            })))
+            .await;
+
+        let inner = handle.inner();
+        let guard = inner.lock().await;
+        let result = guard
+            .record_sync_served_fn
+            .as_ref()
+            .unwrap()(sk.public(), &[[7u8; 32]]);
+        assert!(result.is_err(), "persistence failure must not be swallowed");
     }
 
     /// Verify that the pending_fn filter, when combined with a

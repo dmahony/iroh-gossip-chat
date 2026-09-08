@@ -1158,7 +1158,7 @@ fn main() -> Result<()> {
         let served_ids: Arc<std::sync::Mutex<HashSet<InboxMessageId>>> =
             Arc::new(std::sync::Mutex::new(HashSet::new()));
         // Wire the callback so the protocol handler records served
-        // message IDs after each SyncResponse.
+        // message IDs only after the requester acknowledges each response.
         let served_ids_for_record = served_ids.clone();
         inbox_handle
             .set_record_sync_served_fn(Some(Arc::new(move |_peer, msg_ids| {
@@ -1166,6 +1166,7 @@ fn main() -> Result<()> {
                 for id in msg_ids {
                     set.insert(*id);
                 }
+                Ok(())
             })))
             .await;
         // Serve reconnect sync from the durable mailbox owner.  The provider

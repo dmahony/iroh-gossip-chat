@@ -188,6 +188,27 @@ impl AppState {
 // ── ChatCallbacks impl for AppState ──────────────────────────────────────────
 
 impl ChatCallbacks for AppState {
+    fn persist_remote_file_share(
+        &mut self,
+        topic: Option<TopicId>,
+        _from: PublicKey,
+        _hash: MessageHash,
+        _sent_at: u64,
+        _name: &str,
+        signed_bytes: Option<Vec<u8>>,
+    ) {
+        let (Some(topic), Some(bytes)) = (topic, signed_bytes) else { return; };
+        if !matches!(super::SignedMessage::verify_and_decode(&bytes),
+            Ok((_, super::Message::FileOffer { .. } | super::Message::FileOfferReady { .. }, _))) {
+            return;
+        }
+        let result = crate::store::MessageStore::open(&self.friends.data_dir().join("message_store.db"))
+            .and_then(|store| store.persist_direct_offer(topic.as_bytes(), &bytes, self.local_public.as_bytes(), None));
+        if let Err(error) = result {
+            tracing::warn!(%error, "failed to persist direct offer history");
+        }
+    }
+
     fn local_public(&self) -> PublicKey {
         self.local_public
     }
