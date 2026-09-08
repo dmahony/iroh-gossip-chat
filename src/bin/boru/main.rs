@@ -51,6 +51,7 @@ mod quick_actions;
 mod recent_activity_view_model;
 mod shared_by_me_table;
 mod status_card;
+use boru_core::home_network_info;
 mod theme;
 mod theme_config;
 mod theme_merge;
@@ -2041,6 +2042,7 @@ fn main() -> Result<()> {
             app.network_map_source = _discovery_service
                 .as_ref()
                 .map(|svc| svc.network_map_source());
+            app.home_network_info = Some(home_network_info::start(runtime.handle(), endpoint.clone()));
             // BORU-CP-12: give the UI a read-only handle to the
             // negotiated-capability view (PDF Task 4.3) so optional
             // features (voice/video calls, screen share, file transfer,

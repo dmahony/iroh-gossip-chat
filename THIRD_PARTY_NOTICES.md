@@ -62,7 +62,17 @@ any licence not listed above — is **rejected** by the gate. The few crates
 whose licence is not machine-declarable are handled with an explicit
 clarification (`ring` in `deny.toml`).
 
-## 4. Bundled assets (not part of the compiled binary)
+## 4. Bundled assets
+
+### Embedded offline GeoIP database
+
+Desktop builds include the unmodified **DB-IP IP to City Lite, August 2026**
+database. **IP Geolocation by [DB-IP](https://db-ip.com/)**, licensed under
+[Creative Commons Attribution 4.0 International](https://creativecommons.org/licenses/by/4.0/)
+([legal code](https://creativecommons.org/licenses/by/4.0/legalcode)).
+This database is a separate work, not covered by Boru's source-code license.
+The Home card includes visible provider attribution. Source, checksum, and
+update instructions: [assets/geoip/README.md](assets/geoip/README.md).
 
 | Component | Location | Licence | Notice |
 |---|---|---|---|

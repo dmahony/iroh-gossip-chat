@@ -160,6 +160,13 @@ pub(crate) struct StatusCardDependency {
 
 /// Render the full connection status card.
 pub(crate) fn view_status_card(dep: &StatusCardDependency) -> iced::Element<'static, AppMessage> {
+    view_status_card_with_location(dep, None)
+}
+
+pub(crate) fn view_status_card_with_location(
+    dep: &StatusCardDependency,
+    info: Option<&crate::home_network_info::Snapshot>,
+) -> iced::Element<'static, AppMessage> {
     let accent = variant_accent(dep.variant);
     let indicator = status_indicator(dep.variant, dep.dark_mode);
     let tier = layout_tier(dep.content_width, dep.sizing);
@@ -168,7 +175,22 @@ pub(crate) fn view_status_card(dep: &StatusCardDependency) -> iced::Element<'sta
 
     let heading = status_heading(dep, heading_size);
     let divider = status_divider(accent, dep.sizing);
-    let supporting = network_stats_footer(dep);
+    let supporting = if let Some(info) = info {
+        Column::new()
+            .push(network_stats_footer(dep))
+            .push(fonts::type_role_text(TypeRole::SupportingText, info.addresses.clone())
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph))
+            .push(fonts::type_role_text(TypeRole::SupportingText, info.location.clone())
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph))
+            .push(iced::widget::button(fonts::type_role_text(TypeRole::Metadata, "IP Geolocation by DB-IP · CC BY 4.0 · offline"))
+                .style(iced::widget::button::text)
+                .on_press(AppMessage::OpenUrl("https://db-ip.com/".into())))
+            .spacing(design_tokens::SPACE_8)
+            .width(Length::Fill)
+            .into()
+    } else {
+        network_stats_footer(dep)
+    };
 
     let footer: iced::Element<'static, AppMessage> = if dep.show_retry || dep.show_details {
         Column::new()

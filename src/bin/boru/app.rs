@@ -2840,6 +2840,7 @@ pub struct IcedChat {
     pub(crate) connectivity_store: Option<Arc<StdMutex<PeerConnectivityStore>>>,
     /// Read-only live Network Status map projection supplied by discovery.
     pub(crate) network_map_source: Option<Arc<dyn Fn(Instant) -> boru_core::network_map::NetworkMapState + Send + Sync>>,
+    pub(crate) home_network_info: Option<Arc<StdMutex<crate::home_network_info::Snapshot>>>,
     /// Read handle to the BORU-CP-12 negotiated-capability view (PDF Task
     /// 4.3): answers "does this peer support feature X, and at which
     /// version?" before the UI offers or initiates an optional feature
@@ -6121,6 +6122,7 @@ impl IcedChat {
             dark_mode: app_settings.dark_mode,
             connectivity_store: None,
             network_map_source: None,
+            home_network_info: None,
             capability_gate: None,
             room_directory: None,
             room_delete_confirm_topic: None,

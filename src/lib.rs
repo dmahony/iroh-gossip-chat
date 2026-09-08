@@ -219,6 +219,9 @@ pub mod discovery_service;
 /// is deliberately independent of rendering and presence broadcasting.
 #[cfg(feature = "net")]
 pub mod network_location;
+/// Offline network details for the desktop Home card.
+#[cfg(feature = "gui")]
+pub mod home_network_info;
 /// Pure projection of active presence records for the Network Status map.
 #[cfg(feature = "net")]
 pub mod network_map;

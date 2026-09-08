@@ -99,6 +99,7 @@ pub(crate) struct ChatListDependency {
     pub(crate) network_nodes_online: usize,
     pub(crate) network_countries: usize,
     pub(crate) network_networks: usize,
+    pub(crate) local_network_info: crate::home_network_info::Snapshot,
 }
 
 /// Hash-compatible map point snapshot for the lazy home renderer.
@@ -1203,6 +1204,9 @@ impl IcedChat {
             network_nodes_online: network_map.nodes_online,
             network_countries: network_map.countries,
             network_networks: network_map.networks,
+            local_network_info: self.home_network_info.as_ref()
+                .and_then(|info| info.lock().ok().map(|info| info.clone()))
+                .unwrap_or_default(),
             #[cfg(feature = "dev-ui")]
             drag_placeholder,
             #[cfg(feature = "dev-ui")]
@@ -1480,7 +1484,7 @@ impl IcedChat {
             content_width
         };
         let network_card =
-            crate::status_card::view_status_card(&crate::status_card::StatusCardDependency {
+            crate::status_card::view_status_card_with_location(&crate::status_card::StatusCardDependency {
                 variant,
                 content_width: card_width,
                 headline: headline.clone(),
@@ -1508,7 +1512,7 @@ impl IcedChat {
                 },
                 accent_color: btheme.colors.primary,
                 dark_mode: dep.dark_mode,
-            });
+            }, Some(&dep.local_network_info));
         #[cfg(feature = "dev-ui")]
         let network_card = crate::designer::overlay(
             crate::designer::ComponentId::HomePublicRooms,
