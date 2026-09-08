@@ -482,7 +482,7 @@ fn row_to_conversation_meta(row: &rusqlite::Row) -> Result<ConversationMeta> {
 mod conversation;
 mod history;
 mod direct_offer;
-pub use direct_offer::DirectOfferState;
+pub use direct_offer::{DirectOfferState, DirectOfferStateRow};
 mod inbox;
 mod outbox;
 #[cfg(test)]

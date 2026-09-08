@@ -451,7 +451,7 @@ impl super::MessageStore {
                         signed_bytes, delivery_state, image_identifier, id
                  FROM messages
                  WHERE topic = ?1
-                 ORDER BY timestamp_ms ASC
+                 ORDER BY timestamp_ms ASC, id ASC
                  LIMIT ?2 OFFSET ?3",
             )
             .std_context("prepare get_messages_for_topic")?;

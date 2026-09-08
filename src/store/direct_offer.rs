@@ -4,6 +4,7 @@ use crate::chat_core::protocol::FileOfferId;
 use crate::chat_core::{Message, SignedMessage};
 
 /// Local projection; signed network payloads remain unchanged.
+#[derive(Debug, Clone)]
 pub struct DirectOfferState {
     /// The freshest signed ticket projection, regardless of poster state.
     pub ticket: Option<Vec<u8>>,
@@ -12,6 +13,14 @@ pub struct DirectOfferState {
     /// Legacy/effective projection retained for callers during migration.
     pub ready: Option<Vec<u8>>,
     pub local_path: Option<String>,
+}
+
+/// Direct-offer projections for one room, loaded in one database query.
+#[derive(Debug, Clone)]
+pub struct DirectOfferStateRow {
+    pub owner: [u8; 32],
+    pub offer_id: [u8; 32],
+    pub state: DirectOfferState,
 }
 
 impl MessageStore {
@@ -162,6 +171,40 @@ impl MessageStore {
                 ticket: r.get(0)?, poster: r.get(1)?, ready: r.get(2)?, local_path: r.get(3)?,
             }),
         ).optional().std_context("read direct offer state")
+    }
+
+    /// Load all direct-offer projections for a room in one query. Room history
+    /// replay uses this batch projection instead of opening the store and
+    /// querying once for every attachment row.
+    pub fn direct_offer_states_for_topic(
+        &self,
+        topic: &[u8; 32],
+    ) -> Result<Vec<DirectOfferStateRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT owner, offer_id, ticket_signed, poster_signed, ready_signed, local_path
+             FROM direct_offer_state WHERE topic = ?1",
+        ).std_context("prepare direct offer history projections")?;
+        let mut rows = stmt.query([topic.as_slice()])
+            .std_context("query direct offer history projections")?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().std_context("read direct offer history projection")? {
+            let owner_vec: Vec<u8> = row.get(0).std_context("read direct offer owner")?;
+            let offer_vec: Vec<u8> = row.get(1).std_context("read direct offer id")?;
+            let owner = owner_vec.try_into().map_err(|_| anyhow!("invalid direct offer owner"))?;
+            let offer_id = offer_vec.try_into().map_err(|_| anyhow!("invalid direct offer id"))?;
+            result.push(DirectOfferStateRow {
+                owner,
+                offer_id,
+                state: DirectOfferState {
+                    ticket: row.get(2).std_context("read direct offer ticket")?,
+                    poster: row.get(3).std_context("read direct offer poster")?,
+                    ready: row.get(4).std_context("read direct offer ready")?,
+                    local_path: row.get(5).std_context("read direct offer path")?,
+                },
+            });
+        }
+        Ok(result)
     }
 
     /// Called only after a local download has completed successfully.

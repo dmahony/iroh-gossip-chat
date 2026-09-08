@@ -210,7 +210,7 @@ use boru_core::screen_share::{
     MOD_META, MOD_SHIFT, SCREEN_SHARE_PROTOCOL_VERSION,
 };
 use boru_core::storage::{SharedFileRow, Storage};
-use boru_core::store::MessageStore;
+use boru_core::store::{DirectOfferState, DirectOfferStateRow, MessageStore};
 use boru_core::streaming_server::StreamingServer;
 use boru_core::transfer_state_projection::{
     EventName, ProjectionUpdate, TransferDirection, TransferEvent, TransferRecord, TransferState,
@@ -3812,6 +3812,15 @@ pub enum AppMessage {
         /// left or switched away from is caught in debug builds.
         generation: u64,
     },
+    /// A bounded room-history page loaded without blocking the GUI thread.
+    RoomHistoryLoaded {
+        topic: TopicId,
+        generation: u64,
+        rows: Vec<boru_core::store::ChatMessageRow>,
+        offer_states: Vec<DirectOfferStateRow>,
+        legacy_entries: Vec<HistoryEntry>,
+        error: Option<String>,
+    },
     /// Finished creating a new room (random topic).
     CreateNewRoom,
     /// Confirm create-new-room with current dialog settings.
@@ -7316,6 +7325,7 @@ impl IcedChat {
     fn direct_offer_row_to_chat_entry(
         &self,
         row: &boru_core::store::ChatMessageRow,
+        state: Option<&DirectOfferState>,
     ) -> Option<ChatEntry> {
         let (owner, message, _) =
             SignedMessage::verify_and_decode(row.signed_bytes.as_deref()?).ok()?;
@@ -7330,23 +7340,9 @@ impl IcedChat {
         if owner.as_bytes() != &row.sender {
             return None;
         }
-        let store = match MessageStore::open(&self.data_dir.join("message_store.db")) {
-            Ok(store) => store,
-            Err(error) => {
-                warn!(%error, "cannot restore direct offer");
-                return None;
-            }
-        };
-        let state = match store.direct_offer_state(&row.topic, &row.sender, offer_id) {
-            Ok(state) => state,
-            Err(error) => {
-                warn!(%error, "cannot restore direct offer metadata");
-                return None;
-            }
-        };
         let mut ticket = String::new();
         let mut thumbnail = None;
-        if let Some(bytes) = state.as_ref().and_then(|s| s.ticket.as_deref()) {
+        if let Some(bytes) = state.and_then(|s| s.ticket.as_deref()) {
             if let Ok((
                 signer,
                 Message::FileOfferReady {
@@ -7360,7 +7356,6 @@ impl IcedChat {
                 if signer == owner && ready_id == offer_id {
                     ticket = ready_ticket;
                     thumbnail = state
-                        .as_ref()
                         .and_then(|s| s.poster.as_deref())
                         .and_then(|poster| SignedMessage::verify_and_decode(poster).ok())
                         .and_then(|(_, message, _)| match message {
@@ -7399,7 +7394,7 @@ impl IcedChat {
         };
         download.state = DownloadState::Ready { total: Some(size) };
         if let Some(path) = state
-            .and_then(|s| s.local_path)
+            .and_then(|s| s.local_path.as_deref())
             .map(std::path::PathBuf::from)
         {
             if path.is_file() && path.metadata().is_ok_and(|m| m.len() == size) {
@@ -7915,6 +7910,7 @@ impl IcedChat {
             AppMessage::GoToChatList => "GoToChatList",
             AppMessage::OpenRoom(_) => "OpenRoom",
             AppMessage::RoomOpened { .. } => "RoomOpened",
+            AppMessage::RoomHistoryLoaded { .. } => "RoomHistoryLoaded",
             AppMessage::CreateNewRoom => "CreateNewRoom",
             AppMessage::ConfirmCreateNewRoom => "ConfirmCreateNewRoom",
             AppMessage::CancelCreateRoom => "CancelCreateRoom",
@@ -10581,89 +10577,72 @@ impl IcedChat {
                     }
                 }
 
-                // Load persisted history and replay it into the UI. SQLite's
-                // `messages` table is authoritative; the JSON store is only
-                // imported here for data directories created before the
-                // SQLite history migration.
-                {
-                    let local_hex = self.local_public.to_string();
-                    let legacy_entries: Vec<HistoryEntry> = self
-                        .chat_history
-                        .lock()
-                        .unwrap()
-                        .for_topic(&topic)
-                        .into_iter()
-                        .cloned()
-                        .collect();
-                    let store_path = self.data_dir.join("message_store.db");
-                    let mut sqlite_rows = MessageStore::open(&store_path)
-                        .and_then(|store| {
-                            let mut rows =
-                                store.get_messages_for_topic(topic.as_bytes(), 1_000_000, 0)?;
-                            if rows.is_empty() {
-                                // One-time, idempotent import of the legacy JSON
-                                // mirror. INSERT OR IGNORE makes retries safe.
-                                for entry in &legacy_entries {
-                                    let hash_vec = hex::decode(&entry.hash).unwrap_or_default();
-                                    let hash = if hash_vec.len() == 32 {
-                                        let mut value = [0u8; 32];
-                                        value.copy_from_slice(&hash_vec);
-                                        value
-                                    } else {
-                                        *blake3::hash(&entry.signed_bytes).as_bytes()
-                                    };
-                                    let sender = PublicKey::from_str(&entry.sender)
-                                        .map(|key| *key.as_bytes())
-                                        .unwrap_or([0u8; 32]);
-                                    store.insert_chat_message(
-                                        &hash,
-                                        entry.topic.as_bytes(),
-                                        &sender,
-                                        entry.timestamp,
-                                        &entry.kind,
-                                        &entry.text_preview,
-                                        Some(&entry.signed_bytes),
-                                        entry.image_identifier.as_deref(),
-                                        self.local_public.as_bytes(),
-                                    )?;
-                                }
-                                rows =
-                                    store.get_messages_for_topic(topic.as_bytes(), 1_000_000, 0)?;
+                // History reads, legacy migration, and attachment projections
+                // are deliberately off the Iced update path. Keep the page
+                // bounded; older pages can be requested without OFFSET drift.
+                const ROOM_HISTORY_PAGE_SIZE: usize = 200;
+                let history_path = self.data_dir.join("message_store.db");
+                let history_store = self.chat_history.clone();
+                let local_user = *self.local_public.as_bytes();
+                let history_generation = self.room_generation;
+                bg_tasks.push(iced::Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let legacy_entries: Vec<HistoryEntry> = history_store
+                                .lock()
+                                .map_err(|_| "chat history lock poisoned".to_string())?
+                                .for_topic(&topic)
+                                .into_iter()
+                                .cloned()
+                                .collect();
+                            let store = MessageStore::open(&history_path)
+                                .map_err(|error| format!("open message history: {error}"))?;
+                            let mut rows = store
+                                .get_messages_for_topic(
+                                    topic.as_bytes(),
+                                    ROOM_HISTORY_PAGE_SIZE,
+                                    0,
+                                )
+                                .map_err(|error| format!("read message history: {error}"))?;
+                            if rows.is_empty() && !legacy_entries.is_empty() {
+                                store
+                                    .import_legacy_history(&legacy_entries, &local_user)
+                                    .map_err(|error| format!("import legacy history: {error}"))?;
+                                rows = store
+                                    .get_messages_for_topic(
+                                        topic.as_bytes(),
+                                        ROOM_HISTORY_PAGE_SIZE,
+                                        0,
+                                    )
+                                    .map_err(|error| format!("read imported history: {error}"))?;
                             }
-                            Ok(rows)
+                            let offer_states = store
+                                .direct_offer_states_for_topic(topic.as_bytes())
+                                .map_err(|error| format!("read attachment projections: {error}"))?;
+                            Ok::<_, String>((rows, offer_states, legacy_entries))
                         })
-                        .unwrap_or_default();
-                    for row in &sqlite_rows {
-                        if let Some(chat_entry) = self
-                            .direct_offer_row_to_chat_entry(row)
-                            .or_else(|| Self::chat_message_row_to_chat_entry(row, &local_hex))
-                        {
-                            if let Some(download) = chat_entry.download.as_ref() {
-                                self.download_entry_index = Some(self.entries.len());
-                                if let Some(hash) = download.thumbnail_hash {
-                                    self.pending_thumbnail_fetch.push_back((
-                                        self.entries.len(),
-                                        hash,
-                                        download.ticket.clone(),
-                                    ));
-                                }
-                            }
-                            self.entries_push(chat_entry);
-                        }
-                    }
-                    // Legacy rows with event_id == 0 are valid migration input,
-                    // but must not hide or replace successfully imported SQLite
-                    // history. They are used only if SQLite has no rows.
-                    if sqlite_rows.is_empty() {
-                        for hist_entry in &legacy_entries {
-                            if let Some(chat_entry) =
-                                self.history_entry_to_chat_entry(hist_entry, &topic, &local_hex)
-                            {
-                                self.entries_push(chat_entry);
-                            }
-                        }
-                    }
-                    self.history_saved_count = self.entries.len();
+                        .await
+                        .map_err(|error| format!("history worker failed: {error}"))?
+                    },
+                    move |result| match result {
+                        Ok((rows, offer_states, legacy_entries)) => AppMessage::RoomHistoryLoaded {
+                            topic,
+                            generation: history_generation,
+                            rows,
+                            offer_states,
+                            legacy_entries,
+                            error: None,
+                        },
+                        Err(error) => AppMessage::RoomHistoryLoaded {
+                            topic,
+                            generation: history_generation,
+                            rows: Vec::new(),
+                            offer_states: Vec::new(),
+                            legacy_entries: Vec::new(),
+                            error: Some(error),
+                        },
+                    },
+                ));
 
                     // Overlay the durable event-id delivery state for locally
                     // composed messages. The message-store row id is not the
@@ -10693,7 +10672,6 @@ impl IcedChat {
                             self.rebuild_entry_indexes();
                         }
                     }
-                }
 
                 // Overlay outgoing delivery states from SQLite onto the
                 // ChatEntries so the GUI shows delivery indicators from the
@@ -10836,6 +10814,68 @@ impl IcedChat {
                     all.push(replay_task);
                     iced::Task::batch(all)
                 }
+            }
+
+            AppMessage::RoomHistoryLoaded {
+                topic,
+                generation,
+                rows,
+                offer_states,
+                legacy_entries,
+                error,
+            } => {
+                if self.room_generation != generation
+                    || !matches!(self.screen, Screen::Chat { topic: selected } if selected == topic)
+                {
+                    debug!(%topic, generation, current = self.room_generation, "dropping stale room history page");
+                    return iced::Task::none();
+                }
+                if let Some(error) = error {
+                    warn!(%error, %topic, "room history load failed");
+                    return iced::Task::none();
+                }
+                let local_hex = self.local_public.to_string();
+                let offer_states: std::collections::HashMap<([u8; 32], [u8; 32]), DirectOfferState> =
+                    offer_states
+                        .into_iter()
+                        .map(|row| ((row.owner, row.offer_id), row.state))
+                        .collect();
+                for row in &rows {
+                    let state = row.signed_bytes.as_deref().and_then(|signed| {
+                        let (_, message, _) = SignedMessage::verify_and_decode(signed).ok()?;
+                        let Message::FileOffer { offer_id, .. } = message else {
+                            return None;
+                        };
+                        offer_states.get(&(row.sender, offer_id.as_bytes().to_owned()))
+                    });
+                    if let Some(chat_entry) = self
+                        .direct_offer_row_to_chat_entry(row, state)
+                        .or_else(|| Self::chat_message_row_to_chat_entry(row, &local_hex))
+                    {
+                        if let Some(download) = chat_entry.download.as_ref() {
+                            self.download_entry_index = Some(self.entries.len());
+                            if let Some(hash) = download.thumbnail_hash {
+                                self.pending_thumbnail_fetch.push_back((
+                                    self.entries.len(),
+                                    hash,
+                                    download.ticket.clone(),
+                                ));
+                            }
+                        }
+                        self.entries_push(chat_entry);
+                    }
+                }
+                if rows.is_empty() {
+                    for hist_entry in &legacy_entries {
+                        if let Some(chat_entry) =
+                            self.history_entry_to_chat_entry(hist_entry, &topic, &local_hex)
+                        {
+                            self.entries_push(chat_entry);
+                        }
+                    }
+                }
+                self.history_saved_count = self.entries.len();
+                iced::Task::none()
             }
 
             AppMessage::RoomJoinFailed { error, generation } => {
@@ -32448,7 +32488,7 @@ mod tests {
             drop(store);
             // Reopen SQLite from the exact production restore path, without
             // depending on the pending event queue or in-memory file registry.
-            let entry = app.direct_offer_row_to_chat_entry(row).unwrap();
+            let entry = app.direct_offer_row_to_chat_entry(row, None).unwrap();
             let dl = entry.download.unwrap();
             assert_eq!(dl.name, name);
             assert_eq!(dl.ticket, ticket);
@@ -32468,7 +32508,7 @@ mod tests {
             }
             std::fs::remove_file(&local_path).unwrap();
             assert!(matches!(
-                app.direct_offer_row_to_chat_entry(row)
+                app.direct_offer_row_to_chat_entry(row, None)
                     .unwrap()
                     .download
                     .unwrap()
@@ -32503,7 +32543,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "inactive offers must survive without replay");
         app.conversations.clear();
         app.entries.clear();
-        let entry = app.direct_offer_row_to_chat_entry(&rows[0]).unwrap();
+        let entry = app.direct_offer_row_to_chat_entry(&rows[0], None).unwrap();
         assert_eq!(entry.download.unwrap().ticket, ticket);
     }
 
