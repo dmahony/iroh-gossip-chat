@@ -6421,6 +6421,21 @@ impl IcedChat {
                 }
                 let topic = conv_event.topic;
                 let event = conv_event.event;
+                // Persist background offers before queuing: the process may
+                // exit before this conversation is ever opened/replayed.
+                if let NetEvent::Message { from, message, sent_at, .. } = &event {
+                    if matches!(message, Message::FileOffer { .. } | Message::FileOfferReady { .. })
+                        && boru_core::chat_core::net_event::direct_offer_history_allowed(self, Some(topic), from, *sent_at)
+                    {
+                        let hash = boru_core::chat_core::message_hash(message);
+                        let name = match message { Message::FileOffer { name, .. } => name.as_str(), _ => "" };
+                        if let Some(signed) = boru_core::chat_core::get_signed_message(*from, hash, *sent_at) {
+                            self.persist_remote_file_share(Some(topic), *from, hash, *sent_at, name, Some(signed));
+                        } else {
+                            warn!(%from, "direct-offer history missing verified signed payload");
+                        }
+                    }
+                }
                 // Only bump conversation to the top of the sidebar when there
                 // is an actual user-visible message (text, file, image).
                 // NeighborUp/Down, Presence, AboutMe, Closed, and Error events
@@ -6444,7 +6459,9 @@ impl IcedChat {
                         ..
                     } = &event
                     {
-                        self.emit_message_notification(&topic, from, message);
+                        if Self::_is_user_visible_event(&event) {
+                            self.emit_message_notification(&topic, from, message);
+                        }
                     }
                 }
                 let conversation = self
@@ -6517,15 +6534,24 @@ impl IcedChat {
                     _ => {}
                 }
                 if is_inactive {
-                    // Only queue user-visible messages (chat text, file shares)
-                    // into the pending replay buffer.  Gossip protocol events
+                    // Queue new content and attachment updates for replay.
+                    // A FileOfferReady upgrades an existing card; it must
+                    // survive background routing without adding an unread.
+                    // Gossip protocol events
                     // (AboutMe, Presence, Heartbeat, NeighborUp/Down,
                     // announcements) are not renderable chat history — queueing
                     // them fills the 256-event cap and triggers a warning storm
                     // on dense public topics.  They are
                     // also excluded from the unread counter below.
                     let should_count = Self::_is_user_visible_event(&event);
-                    if !should_count {
+                    let is_attachment_update = matches!(
+                        &event,
+                        NetEvent::Message {
+                            message: Message::FileOfferReady { .. },
+                            ..
+                        }
+                    );
+                    if !should_count && !is_attachment_update {
                         return iced::Task::none();
                     }
                     // Emit a notification for user-visible messages on inactive
@@ -6551,7 +6577,9 @@ impl IcedChat {
                             "pending events cap reached, oldest event dropped"
                         );
                     }
-                    conversation.unread = conversation.unread.saturating_add(1);
+                    if should_count {
+                        conversation.unread = conversation.unread.saturating_add(1);
+                    }
                     tracing::info!(topic=%topic, unread=conversation.unread, "queued event for inactive room");
                     return iced::Task::none();
                 }

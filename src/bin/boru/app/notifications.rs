@@ -336,7 +336,9 @@ impl IcedChat {
             // PAPIRUS-10: no emoji as file-type icons in notifications —
             // the OS notification backend renders plain text, so a text
             // label carries the file type instead of an emoji glyph.
-            crate::Message::FileShare { name, .. } => format!("File: {name}"),
+            crate::Message::FileShare { name, .. } | crate::Message::FileOffer { name, .. } => {
+                format!("File: {name}")
+            }
             crate::Message::ImageShare { .. } => "Image".to_string(),
             crate::Message::SharedGif { .. } => "GIF".to_string(),
             _ => "New message".to_string(),

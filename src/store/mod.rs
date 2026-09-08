@@ -271,6 +271,18 @@ impl MessageStore {
             CREATE INDEX IF NOT EXISTS idx_messages_hash
                 ON messages(msg_hash);
 
+            CREATE TABLE IF NOT EXISTS direct_offer_state (
+                topic BLOB NOT NULL,
+                owner BLOB NOT NULL,
+                offer_id BLOB NOT NULL,
+                announcement_hash BLOB,
+                ready_signed BLOB,
+                ready_at INTEGER NOT NULL DEFAULT 0,
+                has_thumbnail INTEGER NOT NULL DEFAULT 0,
+                local_path TEXT,
+                PRIMARY KEY(topic, owner, offer_id)
+            );
+
             CREATE TABLE IF NOT EXISTS message_replies (
                 message_hash BLOB PRIMARY KEY,
                 reply_to_message_id BLOB NOT NULL,
@@ -426,6 +438,8 @@ fn row_to_conversation_meta(row: &rusqlite::Row) -> Result<ConversationMeta> {
 
 mod conversation;
 mod history;
+mod direct_offer;
+pub use direct_offer::DirectOfferState;
 mod inbox;
 mod outbox;
 #[cfg(test)]

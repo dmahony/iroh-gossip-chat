@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use iroh::{Endpoint, SecretKey};
+use iroh::{Endpoint, PublicKey, SecretKey};
 use n0_error::Result;
 use n0_future::StreamExt;
 
@@ -28,6 +28,23 @@ use crate::public_room_safety::PublicRoomSafety;
 
 /// Maximum clock-skew tolerance for future-dated messages (5 minutes).
 const MAX_FUTURE_SKEW_SECS: u64 = 300;
+
+/// Apply the receive guards before persisting an inactive-room attachment.
+/// Background queues do not otherwise enter the normal callback dispatcher.
+pub fn direct_offer_history_allowed(
+    cb: &impl ChatCallbacks,
+    topic: Option<TopicId>,
+    from: &PublicKey,
+    sent_at: u64,
+) -> bool {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    *from != cb.local_public()
+        && !cb.is_blocked(from)
+        && (cb.is_friend(from) || cb.accepts_group_peer(topic, from))
+        && cb.room_allows(topic, from, crate::authorization::Permission::SendMessages)
+        && now.saturating_sub(sent_at) <= cb.message_ttl().as_secs()
+        && sent_at.saturating_sub(now) <= MAX_FUTURE_SKEW_SECS
+}
 
 /// Apply public-room safety checks to a [`NetEvent`].
 ///
@@ -210,6 +227,8 @@ pub fn handle_net_event_for_topic(
                 | Message::Delete { .. }
                 | Message::Reaction { .. }
                 | Message::FileShare { .. }
+                | Message::FileOffer { .. }
+                | Message::FileOfferReady { .. }
                 | Message::ImageShare { .. }
                 | Message::ProfileUpdate(_) => Some(crate::authorization::Permission::SendMessages),
                 Message::ContactControl { .. } => Some(crate::authorization::Permission::Invite),
@@ -534,6 +553,9 @@ pub fn handle_net_event_for_topic(
                         let fid = FriendId::from_public_key(from);
                         cb.friend_mark_online(fid);
                         let sender_label = cb.resolve_name(&from);
+                        if let Some(signed) = get_signed_message(from, incoming_hash, sent_at) {
+                            cb.persist_remote_file_share(topic, from, incoming_hash, sent_at, &name, Some(signed));
+                        }
                         cb.set_pending_direct_offer(offer_id, name, size, from, Some(sender_label));
                     }
                 }
@@ -545,6 +567,9 @@ pub fn handle_net_event_for_topic(
                     if from != cb.local_public()
                         && (cb.is_friend(&from) || cb.accepts_group_peer(topic, &from))
                     {
+                        if let Some(signed) = get_signed_message(from, incoming_hash, sent_at) {
+                            cb.persist_remote_file_share(topic, from, incoming_hash, sent_at, "", Some(signed));
+                        }
                         let fid = FriendId::from_public_key(from);
                         cb.friend_mark_online(fid);
                         let sender_label = cb.resolve_name(&from);

@@ -1113,6 +1113,16 @@ pub fn spawn_room_event_forwarder(
     })
 }
 
+fn decode_room_chat_payload(
+    bytes: &[u8],
+) -> n0_error::Result<(iroh::PublicKey, crate::chat_core::Message, u64)> {
+    let (from, message, sent_at) = crate::chat_core::SignedMessage::verify_and_decode(bytes)?;
+    // Match the plain gossip forwarder: decoded UI events alone cannot
+    // reconstruct authenticated history after the wire payload is dropped.
+    crate::chat_core::remember_signed_message(from, &message, sent_at, bytes);
+    Ok((from, message, sent_at))
+}
+
 /// Forward one room's gossip stream into chat `NetEvent`s while applying
 /// metadata and roster document updates, with optional public-room safety
 /// enforcement.
@@ -1132,7 +1142,7 @@ pub async fn forward_room_events_for_chat(
     net_tx: mpsc::Sender<crate::chat_core::NetEvent>,
     safety: Option<Arc<PublicRoomSafety>>,
 ) {
-    use crate::chat_core::{NetEvent, SignedMessage};
+    use crate::chat_core::NetEvent;
 
     // Track decode errors to avoid log storms: warn on the first few, then
     // degrade to DEBUG so one broken topic doesn't saturate the log.
@@ -1195,7 +1205,7 @@ pub async fn forward_room_events_for_chat(
         }
 
         match event {
-            GossipEvent::Received(msg) => match SignedMessage::verify_and_decode(&msg.content) {
+            GossipEvent::Received(msg) => match decode_room_chat_payload(&msg.content) {
                 Ok((from, message, sent_at)) => {
                     let net_event = NetEvent::Message {
                         from,
@@ -1267,6 +1277,30 @@ pub async fn forward_room_events_for_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn room_forwarder_retains_signed_direct_offer_history() {
+        use crate::chat_core::{Message, SignedMessage, message_hash, get_signed_message};
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::MessageStore::open(&dir.path().join("messages.db")).unwrap();
+        let key = iroh::SecretKey::generate();
+        let id = crate::chat_core::protocol::FileOfferId::generate();
+        let topic = [17; 32];
+        let ticket = iroh_blobs::ticket::BlobTicket::new(iroh::EndpointAddr::new(key.public()),
+            iroh_blobs::Hash::new(b"video"), iroh_blobs::BlobFormat::Raw).to_string();
+        for message in [Message::file_offer(id, "forwarded.mp4".into(), 5).unwrap(),
+            Message::FileOfferReady { offer_id: id, ticket, thumbnail_hash: None }] {
+            let signed = SignedMessage::sign_and_encode(&key, &message).unwrap();
+            let (from, decoded, sent_at) = decode_room_chat_payload(&signed).unwrap();
+            let cached = get_signed_message(from, message_hash(&decoded), sent_at)
+                .expect("the actual room decoder must retain authenticated bytes");
+            assert_eq!(cached, signed);
+            store.persist_direct_offer(&topic, &cached, &[1; 32], None).unwrap();
+        }
+        assert_eq!(store.get_messages_for_topic(&topic, 100, 0).unwrap().len(), 1);
+        assert!(store.direct_offer_state(&topic, key.public().as_bytes(), id).unwrap().unwrap().ready.is_some());
+        assert!(decode_room_chat_payload(b"unsigned garbage").is_err());
+    }
 
     // ── Metadata validation ─────────────────────────────────────────
 
