@@ -198,8 +198,10 @@ impl IcedChat {
         let mut content = widget::column![
             self.view_chat_header(),
             divider(&self.theme()),
-            self.view_pinned_panel(),
         ];
+        if let Some(pinned_panel) = self.view_pinned_panel() {
+            content = content.push(pinned_panel);
+        }
         #[cfg(feature = "screen-sharing")]
         {
             // Keep the receiver presentation explicit in the conversation
@@ -2949,36 +2951,39 @@ impl IcedChat {
         .into()
     }
 
-    /// Compact pinned-message projection. References whose message is absent
-    /// from the current timeline remain visible as unavailable.
-    pub(crate) fn view_pinned_panel(&self) -> iced::Element<'_, AppMessage> {
+    /// Show only pins whose messages exist in the current chat history.
+    /// Omit the panel entirely when no references can be resolved locally.
+    pub(crate) fn view_pinned_panel(&self) -> Option<iced::Element<'_, AppMessage>> {
         use iced::widget::{button, container, row, text};
         use iced::Length;
-        let hashes = self.pinned_state.pinned(self.topic);
+        let hashes: Vec<_> = self
+            .pinned_state
+            .pinned(self.topic)
+            .into_iter()
+            .filter(|hash| {
+                self.entries
+                    .iter()
+                    .any(|entry| entry.message_hash == Some(*hash))
+            })
+            .take(8)
+            .collect();
         if hashes.is_empty() {
-            return iced::widget::Space::new().height(Length::Fixed(0.0)).into();
+            return None;
         }
         let mut items = row![text("Pinned").size(12)].spacing(SPACE_6);
-        for hash in hashes.iter().take(8) {
-            let available = self
-                .entries
-                .iter()
-                .any(|entry| entry.message_hash == Some(*hash));
-            let label = if available {
-                "Pinned message"
-            } else {
-                "Pinned message unavailable"
-            };
+        for hash in hashes {
             items = items.push(
-                button(text(label).size(11))
-                    .on_press(AppMessage::RevealPinnedMessage(*hash))
+                button(text("Pinned message").size(11))
+                    .on_press(AppMessage::RevealPinnedMessage(hash))
                     .padding([SPACE_2, SPACE_4]),
             );
         }
-        container(items)
-            .width(Length::Fill)
-            .padding([SPACE_2, SPACE_6])
-            .into()
+        Some(
+            container(items)
+                .width(Length::Fill)
+                .padding([SPACE_2, SPACE_6])
+                .into(),
+        )
     }
 
     /// Return the indices of conversation entries matching the live search
@@ -3391,7 +3396,14 @@ impl IcedChat {
             row![
                 crate::fonts::type_role_text(crate::fonts::TypeRole::Metadata, crate::i18n::t("chat.topic_label"))
                     .color(self.color_muted()),
-                crate::fonts::type_role_text(crate::fonts::TypeRole::TechnicalValue, topic_hex.clone()),
+                crate::fonts::type_role_text(
+                    crate::fonts::TypeRole::TechnicalValue,
+                    if topic_hex.len() > 12 {
+                        format!("{}…{}", &topic_hex[..6], &topic_hex[topic_hex.len() - 6..])
+                    } else {
+                        topic_hex.clone()
+                    },
+                ),
             ]
             .spacing(SPACE_4),
             row![
