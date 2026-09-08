@@ -8005,13 +8005,28 @@ impl IcedChat {
                         );
                         return iced::Task::none();
                     };
-                    let expected_size = play_total_size;
+                    let mut expected_size = play_total_size;
                     let downloads_root = self.data_dir.join("downloads");
                     let message_id = entry.event_id;
                     let attachment_id = download.name.clone();
                     if let Err(error) = validate_attachment_filename(&download.name) {
                         self.push_system(format!("Video verification failed: {error}"));
                         return iced::Task::none();
+                    }
+                    // Recover stale progress-size caches only after validating
+                    // the complete file against the ticket's content hash.
+                    if !shared_path && std::fs::metadata(&path).ok().is_some_and(|m| {
+                        expected_size.is_some_and(|size| size != m.len())
+                    }) {
+                        match boru_core::video_playback::verified_completed_attachment_size(
+                            &path, &downloads_root, &expected_hash,
+                        ) {
+                            Ok(size) => expected_size = Some(size),
+                            Err(error) => {
+                                self.push_system(format!("Video verification failed: {error}"));
+                                return iced::Task::none();
+                            }
+                        }
                     }
                     let verify_result = if shared_path {
                         // Sender's own upload: the user-selected source file
@@ -8043,6 +8058,9 @@ impl IcedChat {
                         // Retry only recreates the decoder; the verified local
                         // attachment is not downloaded again.
                         download.playback_error = None;
+                        if let DownloadState::Completed { total_size, .. } = &mut download.state {
+                            *total_size = expected_size;
+                        }
                     }
                     let key = VideoInstanceKey::new(self.topic, message_id, attachment_id);
                     if self.playback_coordinator.active_video() == Some(&key) {

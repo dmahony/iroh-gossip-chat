@@ -7316,11 +7316,8 @@ impl IcedChat {
                                 );
                                 return iced::Task::none();
                             }
-                            let total_size = match &download.state {
-                                DownloadState::Active { total, .. } => *total,
-                                DownloadState::Completed { total_size, .. } => *total_size,
-                                _ => None,
-                            };
+                            // Progress totals may describe only a streamed range.
+                            let total_size = std::fs::metadata(&path).ok().map(|m| m.len());
                             download.state = DownloadState::Completed {
                                 saved_name: name.clone(),
                                 saved_path: Some(path),
@@ -7418,11 +7415,8 @@ impl IcedChat {
                                 );
                                 return iced::Task::none();
                             }
-                            let total_size = match &download.state {
-                                DownloadState::Active { total, .. } => *total,
-                                DownloadState::Completed { total_size, .. } => *total_size,
-                                _ => None,
-                            };
+                            // Use the published file, not a partial progress total.
+                            let total_size = std::fs::metadata(&path).ok().map(|m| m.len());
                             download.state = DownloadState::Completed {
                                 saved_name: name.clone(),
                                 saved_path: Some(path),

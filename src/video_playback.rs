@@ -64,6 +64,18 @@ pub fn verify_local_attachment_unmanaged(
 ) -> Result<PathBuf, String> {
     verify_local_attachment_impl(path, managed_root, expected_hash, expected_size, false)
 }
+/// Recover a stale GUI transfer-size cache only after verifying the entire
+/// file against its content identity. Never use this for a protocol size claim.
+pub fn verified_completed_attachment_size(
+    path: &Path,
+    managed_root: &Path,
+    expected_hash: &str,
+) -> Result<u64, String> {
+    let canonical = verify_local_attachment(path, managed_root, expected_hash, None)?;
+    std::fs::metadata(canonical)
+        .map(|metadata| metadata.len())
+        .map_err(|error| format!("cannot inspect verified attachment: {error}"))
+}
 
 fn verify_local_attachment_impl(
     path: &Path,
@@ -814,6 +826,31 @@ mod jitter_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completed_size_cache_recovery_keeps_strict_identity_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("video.mp4");
+        let bytes = b"complete attachment, not a range progress total";
+        std::fs::write(&path, bytes).unwrap();
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        assert!(super::verify_local_attachment(&path, root.path(), &hash, Some(7)).is_err());
+        let size = super::verified_completed_attachment_size(&path, root.path(), &hash).unwrap();
+        assert_eq!(size, bytes.len() as u64);
+        assert!(super::verify_local_attachment(&path, root.path(), &hash, Some(size)).is_ok());
+        std::fs::write(&path, b"truncated").unwrap();
+        assert!(super::verified_completed_attachment_size(&path, root.path(), &hash).is_err());
+    }
+
+    #[test]
+    fn completed_size_cache_recovery_rejects_unmanaged_files() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("video.mp4");
+        std::fs::write(&path, b"video").unwrap();
+        let hash = blake3::hash(b"video").to_hex().to_string();
+        assert!(super::verified_completed_attachment_size(&path, root.path(), &hash).is_err());
+    }
+
     use std::fs;
 
     use super::*;
