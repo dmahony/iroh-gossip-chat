@@ -1,4 +1,5 @@
-//! Local-only Home network information. No hosted IP lookup requests.
+//! Home network information: bounded HTTPS IP fallback, offline geolocation.
+mod public_ip;
 use iroh::{Endpoint, EndpointAddr, TransportAddr, Watcher};
 use maxminddb::Reader;
 use n0_future::StreamExt;
@@ -12,7 +13,7 @@ use std::{
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 /// Display-only local network details; never broadcast to peers.
 pub struct Snapshot {
-    /// Public and local addresses advertised by the local Iroh endpoint.
+    /// Endpoint addresses and, when needed, HTTPS-observed public addresses.
     pub addresses: String,
     /// Approximate IP-based location or an explicit unavailable message.
     pub location: String,
@@ -139,18 +140,111 @@ pub fn start(runtime: &tokio::runtime::Handle, endpoint: Endpoint) -> Arc<Mutex<
                 .ok()
         });
         let mut addresses = endpoint.watch_addr().stream();
-        while let Some(address) = addresses.next().await {
-            if let Ok(mut value) = output.lock() {
-                *value = snapshot(&address, reader.as_ref());
+        let mut current = endpoint.addr();
+        let mut delay = std::time::Duration::ZERO;
+        let mut retry_secs = 30u64;
+        if let Ok(mut value) = output.lock() {
+            *value = snapshot(&current, reader.as_ref());
+        }
+        loop {
+            // Selecting the address stream against the entire refresh cancels
+            // obsolete lookups, so an old network can never overwrite a new one.
+            tokio::select! {
+                address = addresses.next() => {
+                    let Some(address) = address else { break; };
+                    if address == current { continue; }
+                    current = address;
+                    if let Ok(mut value) = output.lock() {
+                        *value = snapshot(&current, reader.as_ref());
+                    }
+                    delay = std::time::Duration::from_secs(2);
+                    retry_secs = 30;
+                }
+                fallback = async {
+                    tokio::time::sleep(delay).await;
+                    let (v4, v6) = tokio::join!(
+                        discover_missing_family(&current, false),
+                        discover_missing_family(&current, true),
+                    );
+                    [v4, v6].into_iter().flatten().collect::<Vec<_>>()
+                } => {
+                    let resolved = snapshot_with_fallback(&current, reader.as_ref(), &fallback);
+                    if let Ok(mut value) = output.lock() { *value = resolved; }
+                    // A failed refresh removes stale HTTPS results rather than
+                    // presenting an old ISP/VPN exit as current indefinitely.
+                    if fallback.is_empty() {
+                        delay = std::time::Duration::from_secs(retry_secs);
+                        retry_secs = (retry_secs * 2).min(600);
+                    } else {
+                        delay = std::time::Duration::from_secs(300);
+                        retry_secs = 30;
+                    }
+                }
             }
         }
     });
     state
 }
 
+async fn discover_missing_family(address: &EndpointAddr, ipv6: bool) -> Option<std::net::IpAddr> {
+    let available = address.addrs.iter().any(|addr| match addr {
+        TransportAddr::Ip(addr) => {
+            addr.is_ipv6() == ipv6 && crate::network_location::is_public_ip(addr.ip())
+        }
+        _ => false,
+    });
+    if available {
+        None
+    } else {
+        public_ip::discover(ipv6).await
+    }
+}
+
+fn snapshot_with_fallback(
+    address: &EndpointAddr,
+    reader: Option<&Reader<Vec<u8>>>,
+    fallback: &[std::net::IpAddr],
+) -> Snapshot {
+    // Display-only copy: HTTPS results are NOT usable QUIC socket addresses.
+    let mut display_address = address.clone();
+    for ip in fallback {
+        display_address
+            .addrs
+            .insert(TransportAddr::Ip(std::net::SocketAddr::new(*ip, 0)));
+    }
+    let mut value = snapshot(&display_address, reader);
+    if !fallback.is_empty() {
+        value
+            .addresses
+            .push_str("\nHTTPS-observed IP (may be a VPN exit): ");
+        value.addresses.push_str(
+            &fallback
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fallback_resolves_private_only_endpoint_without_mutating_it() {
+        let reader = bundled_reader().unwrap();
+        let endpoint = address(&["192.168.1.20:1234"]);
+        let result =
+            snapshot_with_fallback(&endpoint, Some(&reader), &["8.8.8.8".parse().unwrap()]);
+        assert!(result.addresses.contains("Public IP: 8.8.8.8"));
+        assert!(result.location.contains("Approximate location (8.8.8.8):"));
+        assert_eq!(endpoint.addrs.len(), 1);
+        let expired = snapshot_with_fallback(&endpoint, Some(&reader), &[]);
+        assert!(!expired.location.contains("8.8.8.8"));
+        assert!(expired.addresses.contains("Public IP: not available"));
+    }
+
     #[test]
     fn bundled_database_resolves_public_ip_offline() {
         let reader = bundled_reader().expect("bundled database must decode");

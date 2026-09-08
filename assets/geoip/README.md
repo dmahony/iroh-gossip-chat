@@ -13,15 +13,23 @@ Legal code: https://creativecommons.org/licenses/by/4.0/legalcode
 SHA-256: `2b53203ec36a975051a8189dc1207d624e3bc302fbee47648928476533be69d1`
 
 The desktop binary embeds this compressed database and decompresses it once
-on a background worker. No separate installation or online lookup is needed.
+on a background worker. No separate installation or online geolocation is needed.
 `BORU_GEOIP_CITY` can optionally override it with a newer local MMDB; an invalid
 override falls back to the bundled copy.
 
 Location is approximate, may describe an ISP or VPN exit, and can be stale.
 Only the local Home card receives these details; they are not added to peer
 presence or persisted as user data. Public IPs come from Iroh endpoint address
-discovery, not a hosted IP lookup. Without a discovered public address, the
-card reports location unavailable and still shows local addresses.
+discovery first. Missing IPv4/IPv6 families use bounded HTTPS lookups with
+ipify and independent AWS/icanhazip fallbacks. These services see the connection
+address, but receive no Boru identity or chat data. Requests use OS routing,
+not HTTP proxies; VPN routing still applies. HTTPS results are display-only,
+never installed as QUIC endpoint addresses. Responses are limited to 64 bytes,
+validated as public IPs, and redirects are disabled. Location remains offline.
+Refresh occurs after address changes and every five minutes on success;
+failures back off from 30 seconds to ten minutes and clear stale results.
+Without a discovered public address, the card reports location unavailable
+and still shows local addresses.
 
 To update, download a new DB-IP Lite monthly edition, verify its license and
 gzip integrity, replace the compressed asset, update this source URL/date/hash,
