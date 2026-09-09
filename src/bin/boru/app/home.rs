@@ -158,10 +158,8 @@ pub(crate) struct PeopleActivityCardData {
     pub(crate) activity: RecentActivityCardData,
 }
 
-/// Max visible peer rows in the People & Activity combined card (BORU-HOME-05).
-/// The combined card shows at most 3 peers; extra peers are accessible via
-/// the "View all" header action.
-const PEOPLE_PEERS_MAX: usize = 3;
+/// Fixed-width peer tiles wrap to the available People & Activity card width.
+const PEOPLE_PEER_TILE_WIDTH: f32 = 96.0;
 
 /// Max visible activity rows in the People & Activity combined card (BORU-HOME-05).
 /// Rendered inline beneath the peers section with a restrained divider.
@@ -668,7 +666,7 @@ impl IcedChat {
 
     /// Build the combined People & Activity card (BORU-HOME-05).
     /// Merges online peers + recent activity into one coherent right-rail card.
-    /// The peers section shows up to [`PEOPLE_PEERS_MAX`] online friends with
+    /// The peers section shows online friends in a wrapping grid with
     /// avatar + name + presence; a restrained divider separates it from the
     /// recent activity feed (up to [`PEOPLE_ACTIVITY_MAX`] rows).
     /// BORU-LAYOUT-03: card-sizing constraints (peers body min height,
@@ -711,11 +709,10 @@ impl IcedChat {
             .align_y(Alignment::Center)
             .into()
         } else {
-            let peer_rows: Vec<iced::Element<'static, AppMessage>> = dep
+            let peer_tiles: Vec<iced::Element<'static, AppMessage>> = dep
                 .online
                 .rows
                 .iter()
-                .take(PEOPLE_PEERS_MAX)
                 .map(|row| {
                     let mut avatar = Avatar::new(row.name.clone())
                         .size(crate::design_tokens::AVATAR_CHAT_LIST)
@@ -726,7 +723,8 @@ impl IcedChat {
                         avatar = avatar.image(handle);
                     }
                     let presence_color = row.presence.color(&theme);
-                    let text_col = Column::new()
+                    let tile = Column::new()
+                        .push(avatar.build())
                         .push(
                             crate::fonts::type_role_text(
                                 crate::fonts::TypeRole::Body,
@@ -734,6 +732,7 @@ impl IcedChat {
                             )
                             .color(text_system(&theme))
                             .width(Length::Fill)
+                            .align_x(Alignment::Center)
                             .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
                         )
                         .push(
@@ -744,23 +743,12 @@ impl IcedChat {
                             .color(presence_color),
                         )
                         .spacing(crate::design_tokens::SPACE_2)
-                        .align_x(Alignment::Start)
+                        .align_x(Alignment::Center)
                         .width(Length::Fill);
-                    let row_el = Row::new()
-                        .push(
-                            Space::new()
-                                .width(Length::Fixed(0.0))
-                                .height(Length::Fixed(crate::card_shell::PEER_ROW_HEIGHT)),
-                        )
-                        .push(avatar.build())
-                        .push(Space::new().width(Length::Fixed(SPACE_8)))
-                        .push(text_col)
-                        .spacing(0)
-                        .align_y(Alignment::Center);
-                    button(row_el)
+                    button(tile)
                         .on_press(AppMessage::OpenConversation(row.pk))
-                        .width(Length::Fill)
-                        .padding([0.0, SPACE_8])
+                        .width(Length::Fixed(PEOPLE_PEER_TILE_WIDTH))
+                        .padding(SPACE_8)
                         .style(|t, status| iced::widget::button::Style {
                             background: match status {
                                 iced::widget::button::Status::Pressed => {
@@ -783,18 +771,19 @@ impl IcedChat {
                         .into()
                 })
                 .collect();
-            let row_count = dep.online.rows.len().min(PEOPLE_PEERS_MAX);
-            let body_height = if row_count == 0 {
-                layout.card_sizing.peers_body_min
-            } else {
-                let content = row_count as f32 * btheme.lists.peer_row_height
-                    + (row_count as f32 - 1.0) * btheme.spacing.space_2;
-                content.max(layout.card_sizing.peers_body_min)
-            };
-            Column::with_children(peer_rows)
-                .spacing(SPACE_2)
+            Row::new()
+                .push(
+                    Space::new()
+                        .width(Length::Fixed(0.0))
+                        .height(Length::Fixed(layout.card_sizing.peers_body_min)),
+                )
+                .push(
+                    Row::with_children(peer_tiles)
+                        .spacing(SPACE_8)
+                        .width(Length::Fill)
+                        .wrap(),
+                )
                 .width(Length::Fill)
-                .height(Length::Fixed(body_height))
                 .into()
         };
 
