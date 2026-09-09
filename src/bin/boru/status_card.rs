@@ -853,18 +853,20 @@ fn map_lights_handle(dep: &StatusCardDependency, width: f32, height: f32) -> svg
 fn map_lights_svg(key: &MapCacheKey) -> String {
     let width = f64::from(f32::from_bits(key.width_bits)).max(1.0);
     let height = f64::from(f32::from_bits(key.height_bits)).max(1.0);
-    let scale = (width / 1448.0).min(height / 1086.0);
+    let scale = (width / 1448.0).min(height / 724.0);
     let map_width = 1448.0 * scale;
-    let map_height = 1086.0 * scale;
+    let map_height = 724.0 * scale;
     let left = (width - map_width) / 2.0;
     let top = (height - map_height) / 2.0;
-    let points = key.points.iter().filter_map(|(node_id, latitude, longitude)| {
+    let points = key.points.iter().filter_map(|(_, latitude, longitude)| {
         let (x, y) = project_point(f64::from_bits(*latitude), f64::from_bits(*longitude), map_width, map_height)?;
-        Some(ProjectedMapPoint { node_id: *node_id, x: left + x, y: top + y })
+        Some(ProjectedMapPoint { x: left + x, y: top + y })
     }).collect::<Vec<_>>();
     let [r, g, b] = key.accent.map(|bits| (f32::from_bits(bits).clamp(0.0, 1.0) * 255.0).round() as u8);
     let mut output = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">"#);
-    for point in spread_overlapping_points(&points) {
+    // Alpha compositing increases the brightness of overlapping lights without
+    // moving their geographic centres. Never jitter nearby peers on a map.
+    for point in points {
         let x = point.x.clamp(left, left + map_width);
         let y = point.y.clamp(top, top + map_height);
         output.push_str(&format!(r#"<g fill="rgb({r},{g},{b})"><circle cx="{x}" cy="{y}" r="7" opacity="0.18"/><circle cx="{x}" cy="{y}" r="4" opacity="0.45"/><circle cx="{x}" cy="{y}" r="2"/></g>"#));
@@ -899,52 +901,11 @@ fn network_map_cache() -> &'static Mutex<HashMap<MapCacheKey, svg::Handle>> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ProjectedMapPoint {
-    node_id: iroh_base::PublicKey,
     x: f64,
     y: f64,
 }
 
-const OVERLAP_DISTANCE: f64 = 16.0;
-const MAX_OVERLAP_OFFSET: f64 = 5.5;
-
-/// Spread only points whose original screen positions are close enough to
-/// obscure one another. The seed is derived solely from the node identity, so
-/// the result is stationary across renders and independent of input order.
-fn spread_overlapping_points(points: &[ProjectedMapPoint]) -> Vec<ProjectedMapPoint> {
-    points
-        .iter()
-        .enumerate()
-        .map(|(index, point)| {
-            let overlaps = points.iter().enumerate().any(|(other_index, other)| {
-                index != other_index
-                    && (point.x - other.x).hypot(point.y - other.y) <= OVERLAP_DISTANCE
-            });
-            if !overlaps {
-                return *point;
-            }
-            let seed = stable_node_seed(point.node_id);
-            let angle = (seed as f64 / u64::MAX as f64) * std::f64::consts::TAU;
-            let radius = 3.5 + ((seed >> 32) as f64 / u32::MAX as f64) * 2.0;
-            ProjectedMapPoint {
-                x: point.x + radius.min(MAX_OVERLAP_OFFSET) * angle.cos(),
-                y: point.y + radius.min(MAX_OVERLAP_OFFSET) * angle.sin(),
-                ..*point
-            }
-        })
-        .collect()
-}
-
-fn stable_node_seed(node_id: iroh_base::PublicKey) -> u64 {
-    // FNV-1a is small, dependency-free, and deliberately stable across runs.
-    node_id
-        .as_bytes()
-        .iter()
-        .fold(0xcbf29ce484222325, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        })
-}
-
-/// Project WGS84 coordinates into the shared 1000×500 equirectangular map
+/// Project WGS84 coordinates into the full-world equirectangular map
 /// viewport. Invalid values are omitted and valid edge values are clamped.
 fn project_point(latitude: f64, longitude: f64, width: f64, height: f64) -> Option<(f64, f64)> {
     if !latitude.is_finite()
@@ -1101,7 +1062,7 @@ mod tests {
         let map = ::image::load_from_memory(asset)
             .expect("world map must be a decodable PNG")
             .to_rgba8();
-        assert_eq!(map.dimensions(), (1448, 1086));
+        assert_eq!(map.dimensions(), (1448, 724));
         let mut has_transparent = false;
         let mut has_visible_pixels = false;
         for pixel in map.pixels() {
@@ -1128,79 +1089,55 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_points_are_spread_deterministically_by_node_id() {
-        let base = |byte| ProjectedMapPoint {
-            node_id: iroh_base::SecretKey::from_bytes(&[byte; 32]).public(),
-            x: 500.0,
-            y: 250.0,
+    fn overlapping_lights_keep_their_geographic_centres() {
+        let key = MapCacheKey {
+            width_bits: 1000.0f32.to_bits(),
+            height_bits: 500.0f32.to_bits(),
+            points: (1..=8).map(|byte| (
+                iroh_base::SecretKey::from_bytes(&[byte; 32]).public(),
+                0.0f64.to_bits(),
+                0.0f64.to_bits(),
+            )).collect(),
+            accent: [1.0f32.to_bits(); 3],
         };
-        let points = (1..=8).map(base).collect::<Vec<_>>();
-        let first = spread_overlapping_points(&points);
-        let second = spread_overlapping_points(&points);
-        assert_eq!(first, second);
-        assert_eq!(first.len(), 8);
-        assert!(first
-            .iter()
-            .all(|point| { (point.x - 500.0).hypot(point.y - 250.0) <= MAX_OVERLAP_OFFSET }));
-        assert!(first
-            .iter()
-            .any(|point| point.x != 500.0 || point.y != 250.0));
-        assert!(first.iter().enumerate().any(|(index, point)| {
-            first[index + 1..]
-                .iter()
-                .any(|other| point.x != other.x || point.y != other.y)
-        }));
+        let svg = map_lights_svg(&key);
+        assert_eq!(svg.matches("<circle").count(), 24);
+        assert_eq!(svg.matches("cx=\"500\" cy=\"250\"").count(), 24);
     }
 
     #[test]
-    fn overlap_spreading_preserves_all_same_city_nodes() {
-        let points = (20..=22)
-            .map(|byte| ProjectedMapPoint {
-                node_id: iroh_base::SecretKey::from_bytes(&[byte; 32]).public(),
-                x: 500.0,
-                y: 250.0,
-            })
-            .collect::<Vec<_>>();
-
-        let spread = spread_overlapping_points(&points);
-        assert_eq!(spread.len(), points.len());
-        assert_eq!(
-            spread.iter().map(|point| point.node_id).collect::<Vec<_>>(),
-            points.iter().map(|point| point.node_id).collect::<Vec<_>>()
-        );
-        assert!(spread
-            .iter()
-            .all(|point| { (point.x - 500.0).hypot(point.y - 250.0) <= MAX_OVERLAP_OFFSET }));
-        assert!(spread
-            .windows(2)
-            .any(|pair| pair[0].x != pair[1].x || pair[0].y != pair[1].y));
-    }
-
-    #[test]
-    fn non_overlapping_points_are_unchanged() {
-        let point = ProjectedMapPoint {
-            node_id: iroh_base::SecretKey::from_bytes(&[1; 32]).public(),
-            x: 100.0,
-            y: 200.0,
-        };
-        assert_eq!(spread_overlapping_points(&[point]), vec![point]);
-        let other = ProjectedMapPoint { x: 300.0, ..point };
-        assert_eq!(
-            spread_overlapping_points(&[point, other]),
-            vec![point, other]
-        );
-    }
-
-    #[test]
-    fn same_node_id_gets_the_same_offset_when_overlapping() {
-        let point = ProjectedMapPoint {
-            node_id: iroh_base::SecretKey::from_bytes(&[7; 32]).public(),
-            x: 100.0,
-            y: 200.0,
-        };
-        let first = spread_overlapping_points(&[point, ProjectedMapPoint { x: 100.0, ..point }]);
-        let second = spread_overlapping_points(&[point, ProjectedMapPoint { x: 100.0, ..point }]);
-        assert_eq!(first[0], second[0]);
+    fn city_lights_match_registered_artwork_at_different_sizes() {
+        let map = ::image::load_from_memory(include_bytes!("../../../assets/status/world-map.png"))
+            .unwrap().to_rgba8();
+        // Inland city fixtures across hemispheres, plus ocean controls: tests
+        // the actual raster registration, not just the projection's midpoint.
+        for (latitude, longitude, land) in [
+            (-35.28, 149.13, true), // Canberra
+            (48.86, 2.35, true),   // Paris
+            (39.90, 116.41, true), // Beijing
+            (-15.79, -47.88, true), // Brasilia
+            (41.88, -87.63, true), // Chicago
+            (0.0, -140.0, false),  // Pacific
+            (-30.0, -20.0, false), // Atlantic
+        ] {
+            let (x, y) = project_point(latitude, longitude, 1448.0, 724.0).unwrap();
+            assert_eq!(map.get_pixel(x as u32, y as u32)[3] > 50, land);
+            for (width, height) in [(480.0f32, 240.0f32), (510.0, 240.0), (240.0, 300.0)] {
+                let key = MapCacheKey {
+                    width_bits: width.to_bits(),
+                    height_bits: height.to_bits(),
+                    points: vec![(iroh_base::SecretKey::from_bytes(&[1; 32]).public(),
+                        latitude.to_bits(), longitude.to_bits())],
+                    accent: [1.0f32.to_bits(); 3],
+                };
+                let scale = (f64::from(width) / 1448.0).min(f64::from(height) / 724.0);
+                let cx = (f64::from(width) - 1448.0 * scale) / 2.0
+                    + (longitude + 180.0) / 360.0 * (1448.0 * scale);
+                let cy = (f64::from(height) - 724.0 * scale) / 2.0
+                    + (90.0 - latitude) / 180.0 * (724.0 * scale);
+                assert!(map_lights_svg(&key).contains(&format!("cx=\"{cx}\" cy=\"{cy}\"")));
+            }
+        }
     }
 
     #[test]
