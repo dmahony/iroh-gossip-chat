@@ -66,7 +66,7 @@ fn load_video(path: PathBuf) -> Task<Message> {
                     .map_err(|error| format!("{}: {error}", path.display()))?;
                 let uri = url::Url::from_file_path(&canonical)
                     .map_err(|()| format!("cannot make a file URI for {}", canonical.display()))?;
-                Video::new(&uri)
+                boru_core::video_backend::open_video(&uri)
                     .map(|video| (video, canonical))
                     .map_err(|error| error.to_string())
             })

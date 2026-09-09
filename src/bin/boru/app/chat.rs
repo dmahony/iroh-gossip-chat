@@ -8137,7 +8137,7 @@ impl IcedChat {
                                 };
                                 let uri = url::Url::from_file_path(&canonical)
                                     .map_err(|()| "cannot create file URI".to_string())?;
-                                Video::new(&uri).map_err(|e| e.to_string())
+                                boru_core::video_backend::open_video(&uri).map_err(|e| e.to_string())
                             })
                             .await
                             .map_err(|e| e.to_string())
@@ -8472,7 +8472,7 @@ impl IcedChat {
                                 Ok(uri) => uri,
                                 Err(e) => return Err(format!("invalid stream URL: {e}")),
                             };
-                            Video::new(&uri).map_err(|e| e.to_string())
+                            boru_core::video_backend::open_video(&uri).map_err(|e| e.to_string())
                         })
                         .await
                         .map_err(|e| e.to_string())

@@ -40,6 +40,34 @@ gstreamer1.0-libav
 container opening is not sufficient evidence that a codec works: inspect the
 probe's `Error` event and test the complete stream, including audio.
 
+### Cropped H.264 allocation workaround
+
+Boru and the developer probe construct playback through
+`boru_core::video_backend::open_video`, using the player's supported
+`Video::from_gst_pipeline` API. A synchronous `deep-element-added` hook disables
+`direct-rendering` on libav decoders before they allocate buffers. This keeps
+decoder-owned padded frames separate from downstream NV12 buffers. It applies
+to both verified local attachments and authorized loopback streaming URLs;
+it does not change attachment validation or system-wide codec settings.
+
+On VM-A, the original 406×720 H.264 fixture intermittently aborted with
+`video meta uses 416x720 instead of 406x720` in the native GLib runtime.
+Disabling libav direct rendering prevents the problematic allocation path;
+changing converter order or decoding to an unconstrained null sink is not an
+adequate regression check. The trade-off is an additional decoder frame copy.
+
+Run the fixture regression on the affected runtime explicitly:
+
+```sh
+BORU_VIDEO_REGRESSION_FILE=/absolute/path/to/fixture.mp4 \
+  cargo test --lib --features video-playback \
+  video_backend::tests::cropped_h264_reaches_eos_without_native_abort -- --ignored
+```
+
+This runs the shared pipeline with the real Iced player worker repeatedly to
+EOS, accelerating sinks and replacing audio output with a null sink. It checks
+native decoder survival and EOS, not rendered GUI frames or audible output.
+
 The probe matrix should include a video with audio, a silent video, a portrait
 video, and an intentionally unsupported/corrupt file. In headless CI there is
 no audio sink or graphics display, so use the build check and a real X11/Wayland

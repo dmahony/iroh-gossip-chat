@@ -92,6 +92,9 @@ pub mod room_registry;
 pub mod streaming_server;
 /// Durable video metadata and process-local inline-player coordination.
 pub mod video_playback;
+/// GStreamer pipeline construction with safe libav buffer allocation.
+#[cfg(all(feature = "video-playback", not(target_os = "windows")))]
+pub mod video_backend;
 /// Content-addressed, bounded poster generation for verified local videos.
 pub mod video_poster;
 /// Optional GStreamer runtime capability detection for inline video playback.
